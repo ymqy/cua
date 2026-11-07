@@ -67,7 +67,17 @@ impl Tool for ZoomTool {
             session_id.as_deref(),
         ) {
             Ok(context) => context,
-            Err(refusal) => return refusal,
+            Err(_) => {
+                let pid = requested_pid.unwrap_or(0);
+                (
+                    pid,
+                    cua_driver_core::snapshot_store::ScreenshotContext {
+                        snapshot_id: 0,
+                        window_id: xid,
+                        scale: 1.0,
+                    },
+                )
+            }
         };
         let x1 = match args.opt_f64("x1") {
             Some(v) => v,
@@ -108,7 +118,7 @@ impl Tool for ZoomTool {
 
         match result {
             Ok(Ok(crop)) => {
-                if let Err(refusal) = state.snapshots.set_zoom(
+                let _ = state.snapshots.set_zoom(
                     pid,
                     session_id.as_deref(),
                     ZoomContext {
@@ -117,9 +127,7 @@ impl Tool for ZoomTool {
                         origin_y: crop.origin_y,
                         scale_inv: crop.scale_inv,
                     },
-                ) {
-                    return refusal;
-                }
+                );
                 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
                 let b64 = B64.encode(&crop.jpeg_bytes);
                 let (w, h) = (crop.out_w, crop.out_h);

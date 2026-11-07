@@ -548,7 +548,11 @@ impl Backend for DaemonBackend {
         let request = crate::serve::DaemonRequest {
             method: "call".into(),
             name: Some("check_permissions".into()),
-            args: Some(json!({ "prompt": false, "probe_direct_capture": false })),
+            args: Some(if cfg!(target_os = "macos") {
+                json!({ "prompt": false, "probe_direct_capture": false })
+            } else {
+                json!({ "prompt": false })
+            }),
             session_id: None,
             observation_origin: Some(crate::serve::ToolObservationOrigin::Direct),
             client_kind: Some(cua_driver_core::daemon::DaemonClientKind::Cli),
@@ -557,7 +561,7 @@ impl Backend for DaemonBackend {
             .ok()
             .filter(|r| r.ok)
             .and_then(|r| r.result)
-            .and_then(|r| r.get("structuredContent").cloned());
+            .map(|r| r.get("structuredContent").cloned().unwrap_or(r));
         if let Some(status) = answered {
             return Ok(status);
         }

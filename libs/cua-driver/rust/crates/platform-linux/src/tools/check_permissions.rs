@@ -19,7 +19,7 @@ impl Tool for CheckPermissionsTool {
         PERMS_DEF.get_or_init(|| ToolDef {
             name: "check_permissions".into(),
             description: "Check required permissions for cua-driver-rs on Linux.".into(),
-            input_schema: json!({"type":"object","properties":{"prompt":{"type":"boolean","description":"Ignored: Linux has no permission prompts."}},"additionalProperties":false}),
+            input_schema: json!({"type":"object","properties":{"prompt":{"type":"boolean","description":"Ignored: Linux has no permission prompts."},"probe_direct_capture":{"type":"boolean","description":"Ignored on Linux: macOS-specific probe."}},"additionalProperties":false}),
             read_only: true,
             destructive: false,
             idempotent: true,

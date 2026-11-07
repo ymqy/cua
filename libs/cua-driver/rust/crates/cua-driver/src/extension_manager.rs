@@ -3030,7 +3030,17 @@ fn inspect_archive(
     {
         let mut item = item.context("read extension archive entry")?;
         let entry_type = item.header().entry_type();
+        if entry_type.is_pax_local_extensions()
+            || entry_type.is_pax_global_extensions()
+            || entry_type.is_gnu_longname()
+            || entry_type.is_gnu_longlink()
+        {
+            continue;
+        }
         let path = item.path().context("read archive entry path")?;
+        if path.to_string_lossy().contains("@PaxHeader") {
+            continue;
+        }
         let normalized = safe_relative_path(&path)?;
         if normalized.as_os_str().is_empty() || entry_type.is_dir() {
             continue;
@@ -4964,6 +4974,7 @@ fn safe_relative_path(path: &Path) -> Result<PathBuf> {
     let mut result = PathBuf::new();
     for component in path.components() {
         match component {
+            Component::CurDir => continue,
             Component::Normal(segment) => {
                 let segment = segment.to_str().ok_or_else(|| {
                     anyhow!("archive path is not valid UTF-8: {}", path.display())

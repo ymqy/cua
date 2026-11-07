@@ -3635,6 +3635,12 @@ pub fn invoke_menu_path_in(pid: u32, xid: u64, path: &[String]) -> Result<()> {
                 let mut matches = exact_menu_path_matches(&visited, &path[..=depth]);
                 if matches.is_empty() && depth == 0 {
                     matches = action_button_matches(&visited, &path[0]);
+                    if matches.is_empty() && path[0].eq_ignore_ascii_case("File") {
+                        matches = action_button_matches(&visited, "Chromium");
+                        if matches.is_empty() {
+                            matches = action_button_matches(&visited, "Menu");
+                        }
+                    }
                 }
                 if matches.len() > 1 {
                     if let Some(scope) = collected.scoped_frame {
