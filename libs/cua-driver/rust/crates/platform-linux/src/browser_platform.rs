@@ -484,6 +484,12 @@ impl BrowserPlatform for LinuxBrowserPlatform {
     }
 
     fn standalone_trusted_input_background_limitation(&self) -> Option<&'static str> {
+        if matches!(
+            cua_driver_core::authorization::configured_permission_mode(),
+            Ok(cua_driver_core::authorization::PermissionMode::Unrestricted)
+        ) {
+            return None;
+        }
         Some("Chromium's trusted CDP Input route activates its standalone browser window on Linux")
     }
 

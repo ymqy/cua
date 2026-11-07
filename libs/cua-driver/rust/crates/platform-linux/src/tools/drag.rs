@@ -344,6 +344,13 @@ impl Tool for DragTool {
                     .map(CoordinateContext::Zoom)
             } else {
                 screenshot_scale(&self.state, &args, pid, Some(xid))
+                    .or_else(|e| {
+                        if crate::wayland::wayland_input_enabled() {
+                            Ok(1.0)
+                        } else {
+                            Err(e)
+                        }
+                    })
                     .map(CoordinateContext::Screenshot)
             }
         }) {
