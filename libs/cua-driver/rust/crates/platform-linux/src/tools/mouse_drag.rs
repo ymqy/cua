@@ -87,7 +87,13 @@ impl Tool for MouseDragTool {
         } else {
             let ratio = match screenshot_scale(&self.state, &args, hold.pid, Some(hold.xid)) {
                 Ok(ratio) => ratio,
-                Err(refusal) => return refusal,
+                Err(refusal) => {
+                    if crate::wayland::is_wayland() {
+                        1.0
+                    } else {
+                        return refusal;
+                    }
+                }
             };
             to_x *= ratio;
             to_y *= ratio;

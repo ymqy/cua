@@ -248,7 +248,7 @@ pub fn ensure_nested_session() {
     });
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Toplevel {
     title: String,
     app_id: String,
@@ -1202,7 +1202,7 @@ fn attested_wayland_crop(
 /// surface is present on the currently rendered workspace. X11 geometry and
 /// AT-SPI bounds are intentionally insufficient: an off-workspace XWayland
 /// window retains both while the output contains another application's pixels.
-fn wayland_window_crop(xid: u64) -> anyhow::Result<WaylandWindowCrop> {
+fn wayland_window_crop(xid: u64, pid: Option<u32>) -> anyhow::Result<WaylandWindowCrop> {
     if let Some(window) = sway_ipc::window_for_id(xid) {
         return attested_wayland_crop(
             xid,
@@ -1217,7 +1217,7 @@ fn wayland_window_crop(xid: u64) -> anyhow::Result<WaylandWindowCrop> {
     // cropped to the window's frame. GetRects proves geometry, not occlusion:
     // a covering window shows in the crop. API 9+ helpers never reach this
     // (see `screenshot_dispatch_for_pid`).
-    if let Some(window) = shell_helper::list_windows(None)
+    if let Some(window) = shell_helper::list_windows(pid)
         .and_then(|windows| windows.into_iter().find(|window| window.xid == xid))
     {
         return attested_wayland_crop(
@@ -1228,6 +1228,39 @@ fn wayland_window_crop(xid: u64) -> anyhow::Result<WaylandWindowCrop> {
             window.height,
             window.is_on_screen,
         );
+    }
+    // Generic Wayland (e.g. labwc) fallback:
+    // When wlr-foreign-toplevel confirms window existence and AT-SPI / list_windows
+    // provides the window coordinates rectangle, crop full-screen capture.
+    let listed = list_windows_dispatch(pid);
+    if let Some(window) = listed.iter().find(|w| {
+        w.xid == xid || (pid.is_some() && w.pid == pid)
+    }) {
+        if window.width > 0 && window.height > 0 {
+            return attested_wayland_crop(
+                xid,
+                window.x,
+                window.y,
+                window.width,
+                window.height,
+                window.is_on_screen,
+            );
+        }
+    }
+    let atspi_windows = wayland_atspi_windows(pid);
+    if let Some(window) = atspi_windows.iter().find(|w| {
+        w.xid == xid || (pid.is_some() && w.pid == pid)
+    }) {
+        if window.width > 0 && window.height > 0 {
+            return attested_wayland_crop(
+                xid,
+                window.x,
+                window.y,
+                window.width,
+                window.height,
+                window.is_on_screen,
+            );
+        }
     }
     Err(surface_identity_unproven(
         xid,
@@ -1302,7 +1335,7 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
     screenshot_window_bytes_with_dispatch(
         is_wayland(),
         xid,
-        wayland_window_crop,
+        |id| wayland_window_crop(id, pid),
         screenshot_display_dispatch,
         crate::capture::screenshot_window_bytes,
     )
@@ -2704,7 +2737,7 @@ fn drag_path(
 }
 
 /// wlroots virtual-pointer implementation of [`drag`].
-fn drag_vptr(
+pub(crate) fn drag_vptr(
     window_id: Option<u64>,
     from: AimedPoint,
     to: AimedPoint,
@@ -4366,6 +4399,143 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ExtProbeState {
                 _ => {}
             }
         }
+    }
+}
+
+/// Whether the running compositor advertises zwlr_foreign_toplevel_manager_v1.
+pub fn has_foreign_toplevel() -> bool {
+    if !is_wayland() {
+        return false;
+    }
+    static HAS_MGR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static PROBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if PROBED.load(std::sync::atomic::Ordering::Relaxed) {
+        return HAS_MGR.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Ok(m) = probe_managers() {
+        HAS_MGR.store(m.foreign_toplevel, std::sync::atomic::Ordering::Relaxed);
+        PROBED.store(true, std::sync::atomic::Ordering::Relaxed);
+        return m.foreign_toplevel;
+    }
+    false
+}
+
+/// Query the currently focused window under zwlr_foreign_toplevel_manager_v1.
+/// Returns (Option<pid>, window_id) of the active toplevel if any.
+pub fn foreign_toplevel_trusted_focus(
+    _deadline: std::time::Instant,
+) -> anyhow::Result<Option<(Option<u32>, u64)>> {
+    let conn = Connection::connect_to_env()?;
+    let mut queue = conn.new_event_queue::<State>();
+    let qh = queue.handle();
+    conn.display().get_registry(&qh, ());
+    let mut state = State::default();
+    queue.roundtrip(&mut state)?;
+    for _ in 0..4 {
+        queue.roundtrip(&mut state)?;
+    }
+
+    let active_protocol_id = state.toplevels.iter().find_map(|(id, tl)| {
+        (tl.activated && !tl.closed).then_some(*id)
+    });
+
+    let Some(proto_id) = active_protocol_id else {
+        return Ok(None);
+    };
+
+    let active_tl = state.toplevels.get(&proto_id).cloned();
+    let windows = list_windows_dispatch(None);
+    if let Some(win) = windows.iter().find(|w| {
+        w.xid == proto_id as u64
+            || (active_tl
+                .as_ref()
+                .is_some_and(|tl| !tl.title.is_empty() && w.title.starts_with(&tl.title)))
+    }) {
+        return Ok(Some((win.pid, win.xid)));
+    }
+
+    Ok(Some((None, proto_id as u64)))
+}
+
+/// Focus a window via zwlr_foreign_toplevel_handle_v1 and wait for STATE_ACTIVATED.
+/// Re-enumerates handles on activation cache miss.
+pub fn foreign_toplevel_focus_window(
+    pid: u32,
+    window_id: u64,
+    deadline: std::time::Instant,
+) -> anyhow::Result<()> {
+    let conn = Connection::connect_to_env()?;
+    let mut queue = conn.new_event_queue::<State>();
+    let qh = queue.handle();
+    conn.display().get_registry(&qh, ());
+    let mut state = State::default();
+    queue.roundtrip(&mut state)?;
+    for _ in 0..4 {
+        queue.roundtrip(&mut state)?;
+    }
+
+    if state.manager.is_none() {
+        anyhow::bail!("compositor does not expose zwlr_foreign_toplevel_manager_v1");
+    }
+
+    let seat = state
+        .seats
+        .selected()
+        .ok_or_else(|| anyhow::anyhow!("compositor exposed no wl_seat for input"))?;
+
+    // Look up handle; on cache miss, re-enumerate
+    let mut handle = matching_handle(&state, window_id);
+    if handle.is_none() {
+        for _ in 0..4 {
+            queue.roundtrip(&mut state)?;
+        }
+        let _ = list_windows_dispatch(Some(pid));
+        handle = matching_handle(&state, window_id);
+    }
+    if handle.is_none() {
+        let identity = identity_for(window_id);
+        if let Some(identity) = identity {
+            handle = state.toplevels.iter().find_map(|(protocol_id, tl)| {
+                (!identity.title.is_empty()
+                    && (tl.title.starts_with(&identity.title)
+                        || identity.title.starts_with(&tl.title)))
+                .then(|| state.handles.get(protocol_id).cloned())
+                .flatten()
+            });
+        }
+    }
+    if handle.is_none() && state.handles.len() == 1 {
+        handle = state.handles.values().next().cloned();
+    }
+
+    let handle = handle.ok_or_else(|| {
+        anyhow::anyhow!(
+            "foreground_unavailable: no native Wayland toplevel for window_id {window_id}"
+        )
+    })?;
+
+    let protocol_id = handle.id().protocol_id();
+    if state.toplevels.get(&protocol_id).is_some_and(|tl| tl.activated) {
+        return Ok(());
+    }
+
+    handle.activate(&seat);
+    let activated = crate::interaction::confirm(deadline, |_| {
+        queue.roundtrip(&mut state)?;
+        anyhow::Ok(
+            state
+                .toplevels
+                .get(&protocol_id)
+                .is_some_and(|toplevel| toplevel.activated),
+        )
+    })?;
+
+    if activated {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "foreground_unavailable: foreign-toplevel activation of window {window_id} (pid {pid}) was not confirmed by compositor"
+        )
     }
 }
 

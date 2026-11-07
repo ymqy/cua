@@ -136,6 +136,33 @@ pub fn with_target_foreground<T>(
             |(), (pid, prior), cleanup| shell_helper::trusted_focus_window(pid, prior, cleanup),
         );
     }
+    if crate::wayland::has_foreign_toplevel() {
+        policy::identity(
+            &(pid, window_id),
+            &facts::Fact::Known(Some((pid, window_id))),
+        )?;
+        return transaction(
+            &mut (),
+            |()| {
+                let prior = crate::wayland::foreign_toplevel_trusted_focus(confirm())?;
+                if policy::focused(&(Some(pid), window_id), &facts::Fact::Known(prior)) {
+                    return Ok(None);
+                }
+                let restorable = prior
+                    .and_then(|(p, id)| p.map(|p| (p, id)))
+                    .or(Some((pid, window_id)));
+                policy::restore(facts::Fact::Known(restorable)).map(Some)
+            },
+            |(), _| crate::wayland::foreign_toplevel_focus_window(pid, window_id, confirm()),
+            body,
+            |(), (prior_pid, prior_id), cleanup| {
+                let _ = crate::wayland::foreign_toplevel_focus_window(
+                    prior_pid, prior_id, cleanup,
+                );
+                Ok(())
+            },
+        );
+    }
     anyhow::bail!(
         "foreground_unavailable: no trusted Wayland compositor adapter can confirm exact target window {window_id} for pid {pid}; no global keyboard input was sent"
     )

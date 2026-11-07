@@ -78,6 +78,7 @@ impl Tool for MouseButtonDownTool {
         let button = parse_mouse_button(button_name.as_str());
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
+        let is_wl = crate::wayland::is_wayland();
         let desktop_frame = desktop_frame_requested(&args);
         if desktop_frame {
             // Desktop pixels: no zoom/screenshot scaling; translated once below.
@@ -93,7 +94,13 @@ impl Tool for MouseButtonDownTool {
         } else {
             let ratio = match screenshot_scale(&self.state, &args, pid, Some(xid)) {
                 Ok(ratio) => ratio,
-                Err(refusal) => return refusal,
+                Err(refusal) => {
+                    if is_wl {
+                        1.0
+                    } else {
+                        return refusal;
+                    }
+                }
             };
             x *= ratio;
             y *= ratio;
@@ -125,7 +132,6 @@ impl Tool for MouseButtonDownTool {
 
         let xi = x as i32;
         let yi = y as i32;
-        let is_wl = crate::wayland::is_wayland();
         // Native Wayland: route through the persistent virtual-pointer module
         // so the held button survives across tool calls; the X11 path keeps
         // the existing input::send_button_down behaviour.

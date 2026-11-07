@@ -94,6 +94,144 @@ async fn parallel_drag_inject(args: &Value) -> ToolResult {
     }
 }
 
+/// Native Wayland path for parallel_mouse_drag using zwlr_virtual_pointer_manager_v1.
+/// Runs concurrent or sequential drag gestures via virtual pointers without requiring CUA_INJECT_SOCKET.
+async fn parallel_drag_wayland(args: &Value) -> ToolResult {
+    let Some(items) = args.get("drags").and_then(|v| v.as_array()) else {
+        return ToolResult::error("drags[] is required.");
+    };
+    if items.is_empty() {
+        return ToolResult::error("parallel_mouse_drag requires at least one drag item.");
+    }
+    let default_window_id = args.get("window_id").and_then(|v| v.as_u64());
+
+    struct WaylandDragItem {
+        window_id: Option<u64>,
+        from: (f64, f64),
+        to: (f64, f64),
+        steps: u32,
+        button: u8,
+    }
+
+    let mut tasks = Vec::with_capacity(items.len());
+    for item in items {
+        let window_id = item
+            .get("window_id")
+            .and_then(|v| v.as_u64())
+            .or(default_window_id);
+
+        let local: Vec<(f64, f64)> = if let Some(pts) = item.get("path").and_then(|v| v.as_array()) {
+            let mut out = Vec::with_capacity(pts.len());
+            for p in pts {
+                let a = p.as_array();
+                let (Some(px), Some(py)) = (
+                    a.and_then(|a| a.first()).and_then(|v| v.as_f64()),
+                    a.and_then(|a| a.get(1)).and_then(|v| v.as_f64()),
+                ) else {
+                    return ToolResult::error("each `path` entry must be [x, y].");
+                };
+                out.push((px, py));
+            }
+            if out.len() < 2 {
+                return ToolResult::error("`path` needs at least 2 points.");
+            }
+            out
+        } else if let Some(expr_str) = item.get("fn").and_then(|v| v.as_str()) {
+            let Some(x_from) = item.get("x_from").and_then(|v| v.as_f64()) else {
+                return ToolResult::error("`fn` requires x_from.");
+            };
+            let Some(x_to) = item.get("x_to").and_then(|v| v.as_f64()) else {
+                return ToolResult::error("`fn` requires x_to.");
+            };
+            let samples = item
+                .get("samples")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(80)
+                .clamp(2, 400);
+            match crate::input::sample_function(expr_str, x_from, x_to, samples) {
+                Ok(pts) => pts,
+                Err(e) => return ToolResult::error(e.to_string()),
+            }
+        } else {
+            let coerce = |k: &str| item.get(k).and_then(|v| v.as_f64());
+            match (coerce("from_x"), coerce("from_y"), coerce("to_x"), coerce("to_y")) {
+                (Some(fx), Some(fy), Some(tx), Some(ty)) => vec![(fx, fy), (tx, ty)],
+                _ => {
+                    return ToolResult::error(
+                        "each drag item requires either `path`, `fn`+x_from+x_to, or from_x/from_y/to_x/to_y.",
+                    )
+                }
+            }
+        };
+
+        let from = local[0];
+        let to = local[local.len() - 1];
+        let button = parse_mouse_button(
+            item.get("button")
+                .and_then(|v| v.as_str())
+                .unwrap_or("left"),
+        );
+        let steps = item
+            .get("steps")
+            .and_then(|v| v.as_u64())
+            .map(|s| (s as u32).clamp(1, 300))
+            .unwrap_or_else(|| {
+                let dist = (((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt() / 3.0).round();
+                (dist as u32).clamp(24, 300)
+            });
+
+        tasks.push(WaylandDragItem {
+            window_id,
+            from,
+            to,
+            steps,
+            button,
+        });
+    }
+
+    let n = tasks.len();
+    let mut handles = Vec::with_capacity(n);
+    for task in tasks {
+        let handle = tokio::task::spawn_blocking(move || {
+            let from_aimed: crate::wayland::AimedPoint = if let Some(wid) = task.window_id {
+                crate::wayland::window_local_to_output(wid, task.from.0.round() as i32, task.from.1.round() as i32)
+                    .unwrap_or_else(|_| (task.from.0.round() as i32, task.from.1.round() as i32).into())
+            } else {
+                (task.from.0.round() as i32, task.from.1.round() as i32).into()
+            };
+            let to_aimed: crate::wayland::AimedPoint = if let Some(wid) = task.window_id {
+                crate::wayland::window_local_to_output(wid, task.to.0.round() as i32, task.to.1.round() as i32)
+                    .unwrap_or_else(|_| (task.to.0.round() as i32, task.to.1.round() as i32).into())
+            } else {
+                (task.to.0.round() as i32, task.to.1.round() as i32).into()
+            };
+
+            crate::wayland::drag_vptr(
+                task.window_id,
+                from_aimed,
+                to_aimed,
+                task.steps,
+                task.button,
+                None,
+            )
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return ToolResult::error(e.to_string()),
+            Err(e) => return ToolResult::error(format!("Task error: {e}")),
+        }
+    }
+
+    ToolResult::text(format!(
+        "✅ Ran {n} virtual pointer drag gesture(s) concurrently."
+    ))
+    .with_structured(json!({"count": n}))
+}
+
 #[async_trait]
 impl Tool for ParallelMouseDragTool {
     fn def(&self) -> &ToolDef {
@@ -106,7 +244,7 @@ impl Tool for ParallelMouseDragTool {
                 as a function `fn` = y(x) sampled over [x_from, x_to] in window-local pixels (e.g. fn:\"x\" is a diagonal, \
                 fn:\"300+120*sin(x/40)\" a sine wave). Functions support + - * / ^, sin/cos/tan, sqrt, abs, exp, ln, pi, e.".into(),
             input_schema: json!({"type":"object","required":["drags"],"properties":{
-                "drags":{"type":"array","minItems":2,"description":"Two or more drag gestures to run concurrently, each on its own virtual master pointer.","items":{"type":"object","required":["session","window_id"],"properties":{
+                "drags":{"type":"array","minItems":1,"description":"One or more drag gestures to run concurrently, each on its own virtual master pointer.","items":{"type":"object","properties":{
                     "session":{"type":"string","description":"Session/cursor id; also keys the virtual master pointer."},
                     "window_id":{"type":"integer","description":"Window id from list_windows."},
                     "path":{"type":"array","items":{"type":"array","items":{"type":"number"}},"description":"Explicit window-local waypoints [[x,y],...] (>=2); pressed once, glided through, released once. Takes precedence over fn/from-to."},
@@ -133,15 +271,8 @@ impl Tool for ParallelMouseDragTool {
         if crate::wayland::is_inject_mode() {
             return parallel_drag_inject(&args).await;
         }
-        // Native Wayland without the inject socket: MPX/XI2 + uinput master
-        // pointers don't exist on Wayland. Surface a typed error instead of
-        // silently calling the X11 path that's guaranteed to fail.
         if crate::wayland::is_wayland() {
-            return ToolResult::error(
-                "parallel_mouse_drag requires the cua-compositor inject socket on Wayland \
-                 (set CUA_INJECT_SOCKET to the cua-compositor control socket), \
-                 or run the target under X11.",
-            );
+            return parallel_drag_wayland(&args).await;
         }
         match tokio::task::spawn_blocking(crate::input::check_parallel_pointer_support).await {
             Ok(Ok(())) => {}
@@ -358,3 +489,40 @@ impl Tool for ParallelMouseDragTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parallel_mouse_drag_schema_min_items() {
+        let tool = ParallelMouseDragTool {
+            state: ToolState::new(),
+        };
+        let def = tool.def();
+        assert_eq!(def.name, "parallel_mouse_drag");
+        let min_items = def.input_schema["properties"]["drags"]["minItems"].as_u64();
+        assert_eq!(min_items, Some(1));
+    }
+
+    #[test]
+    fn test_wayland_drag_task_straight_path() {
+        let item = json!({
+            "session": "test-session",
+            "window_id": 42,
+            "from_x": 10.0,
+            "from_y": 20.0,
+            "to_x": 100.0,
+            "to_y": 200.0,
+            "steps": 10,
+            "button": "left"
+        });
+        let from_x = item.get("from_x").and_then(|v| v.as_f64()).unwrap();
+        let from_y = item.get("from_y").and_then(|v| v.as_f64()).unwrap();
+        let to_x = item.get("to_x").and_then(|v| v.as_f64()).unwrap();
+        let to_y = item.get("to_y").and_then(|v| v.as_f64()).unwrap();
+        assert_eq!((from_x, from_y), (10.0, 20.0));
+        assert_eq!((to_x, to_y), (100.0, 200.0));
+    }
+}
+

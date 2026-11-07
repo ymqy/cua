@@ -90,7 +90,16 @@ fn mouse_button_up_coordinates(
         return Ok(context.zoom_to_window(x, y));
     }
 
-    let ratio = screenshot_scale(state, args, hold.pid, Some(hold.xid))?;
+    let ratio = match screenshot_scale(state, args, hold.pid, Some(hold.xid)) {
+        Ok(ratio) => ratio,
+        Err(refusal) => {
+            if crate::wayland::is_wayland() {
+                1.0
+            } else {
+                return Err(refusal);
+            }
+        }
+    };
     x *= ratio;
     y *= ratio;
     Ok((x, y))
