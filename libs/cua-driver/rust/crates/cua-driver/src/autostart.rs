@@ -581,16 +581,117 @@ Register-ScheduledTask -Force -TaskName $env:CUA_DRIVER_AS_TASK -Action $action 
     }
 }
 
-// ── macOS / Linux stubs ───────────────────────────────────────────────────
+#[cfg(target_os = "linux")]
+mod platform {
+    use super::*;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
-#[cfg(not(target_os = "windows"))]
+    fn autostart_desktop_path() -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        Some(home.join(".config").join("autostart").join("cua-driver.desktop"))
+    }
+
+    fn is_container_s6_environment() -> bool {
+        Path::new("/run/s6").exists()
+            || Path::new("/var/run/s6").exists()
+            || Path::new("/custom-cont-init.d").exists()
+            || Path::new("/etc/s6-overlay").exists()
+    }
+
+    fn is_registered() -> bool {
+        if is_container_s6_environment() {
+            if let Ok(entries) = fs::read_dir("/custom-cont-init.d") {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.contains("cua") {
+                        return true;
+                    }
+                }
+            }
+        }
+        if let Some(desktop) = autostart_desktop_path() {
+            if desktop.is_file() {
+                return true;
+            }
+        }
+        if Path::new("/etc/xdg/autostart/cua-driver.desktop").is_file() {
+            return true;
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let user_unit = PathBuf::from(home).join(".config/systemd/user/cua-driver.service");
+            if user_unit.is_file() {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn enable(exe: &str) -> Result<()> {
+        if let Some(desktop) = autostart_desktop_path() {
+            if let Some(parent) = desktop.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let content = format!(
+                "[Desktop Entry]\n\
+                 Type=Application\n\
+                 Name=Cua Driver\n\
+                 Exec={exe} serve\n\
+                 Hidden=false\n\
+                 NoDisplay=false\n\
+                 X-GNOME-Autostart-enabled=true\n"
+            );
+            fs::write(&desktop, content)?;
+            return Ok(());
+        }
+        Err(anyhow!("Cannot determine home directory for autostart desktop entry"))
+    }
+
+    pub fn disable() -> Result<()> {
+        if let Some(desktop) = autostart_desktop_path() {
+            if desktop.exists() {
+                fs::remove_file(&desktop)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn status() -> Result<Status> {
+        let running = crate::serve::is_daemon_listening(&crate::serve::default_socket_path());
+        let registered = is_registered();
+        match (registered, running) {
+            (true, true) => Ok(Status::RegisteredRunning),
+            (true, false) => Ok(Status::RegisteredIdle),
+            (false, true) => Ok(Status::RegisteredRunning),
+            (false, false) => Ok(Status::NotRegistered),
+        }
+    }
+
+    pub fn kick() -> Result<()> {
+        if crate::serve::is_daemon_listening(&crate::serve::default_socket_path()) {
+            return Ok(());
+        }
+        let exe = super::current_exe_for_autostart()?;
+        Command::new(exe)
+            .arg("serve")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow!("failed to spawn daemon: {e}"))?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
 mod platform {
     use super::*;
 
-    const NOT_YET: &str = "cua-driver autostart is currently Windows-only. macOS users: see \
+    const NOT_YET: &str = "cua-driver autostart is currently Windows and Linux only. macOS users: see \
          libs/cua-driver/scripts/install-local.sh --autostart for the \
-         LaunchAgent recipe. Linux users: same script registers a systemd \
-         --user unit. A cross-platform impl is tracked as a follow-up.";
+         LaunchAgent recipe.";
 
     pub fn enable(_exe: &str) -> Result<()> {
         Err(anyhow!(NOT_YET))

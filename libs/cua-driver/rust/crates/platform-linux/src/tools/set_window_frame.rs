@@ -8,6 +8,31 @@ use cua_driver_core::{
 };
 use serde_json::Value;
 
+fn detect_cdp_port(pid: Option<u32>) -> Option<u16> {
+    if let Ok(val) = std::env::var("CUA_DRIVER_CDP_PORT") {
+        if let Ok(port) = val.parse::<u16>() {
+            return Some(port);
+        }
+    }
+    if let Some(pid) = pid {
+        if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+            for arg in cmdline.split('\0') {
+                if let Some(port_str) = arg.strip_prefix("--remote-debugging-port=") {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        return Some(port);
+                    }
+                }
+            }
+        }
+    }
+    for port in [9223, 9222] {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return Some(port);
+        }
+    }
+    None
+}
+
 // ── set_window_frame (Linux) ─────────────────────────────────────────────────
 
 pub struct SetWindowFrameTool;
@@ -44,11 +69,6 @@ impl Tool for SetWindowFrameTool {
                 Ok(input) => input,
                 Err(result) => return result,
             };
-        if crate::wayland::is_wayland() {
-            return ToolResult::error(
-                "set_window_frame: this Wayland compositor exposes no protocol that permits a client to set another top-level window's geometry",
-            );
-        }
         let values = [input.x, input.y, input.width, input.height];
         if values.iter().any(|value| !value.is_finite())
             || input.width <= 0.0
@@ -90,6 +110,46 @@ impl Tool for SetWindowFrameTool {
             Ok(value) => value,
             Err(error) => return ToolResult::error(format!("set_window_frame: {error}")),
         };
+
+        if crate::wayland::is_wayland() {
+            if let Some(port) = detect_cdp_port(Some(input.pid)) {
+                match cua_driver_core::cdp::set_window_bounds_via_cdp(port, x, y, width, height).await {
+                    Ok((actual_x, actual_y, actual_w, actual_h)) => {
+                        let confirmed = (actual_x, actual_y, actual_w, actual_h) == (x, y, width, height);
+                        let requested = (x, y, width, height);
+                        let observed = Some((actual_x, actual_y, actual_w, actual_h));
+                        let effect = effect_from_value_readback(confirmed, true, true);
+                        let mut record = ActionExecutionRecord::builder(
+                            effect,
+                            ActionTransport::BrowserCdpWindowBounds,
+                            RequestedDelivery::NotApplicable,
+                        )
+                        .actual_delivery(ActualDelivery::NotApplicable)
+                        .detail(format!("requested={requested:?} observed={observed:?} via cdp:{port}"));
+                        record = record.evidence(ActionEvidence {
+                            kind: EvidenceKind::ValueReadback,
+                            detail: if confirmed {
+                                "CDP geometry readback matched the requested frame".into()
+                            } else {
+                                "CDP geometry readback did not match the requested frame".into()
+                            },
+                        });
+                        return ToolResult::text(if confirmed {
+                            "Set and verified the requested window frame via CDP."
+                        } else {
+                            "The window frame did not settle at the requested geometry via CDP."
+                        })
+                        .with_action_record(record.build().expect("set_window_frame record is valid"));
+                    }
+                    Err(error) => {
+                        tracing::warn!("CDP set_window_bounds failed: {error}");
+                    }
+                }
+            }
+            return ToolResult::error(
+                "set_window_frame: this Wayland compositor exposes no protocol that permits a client to set another top-level window's geometry",
+            );
+        }
         let window_id = input.window_id;
         let pid = input.pid;
         let outcome = tokio::task::spawn_blocking(move || {

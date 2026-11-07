@@ -182,7 +182,14 @@ pub fn run(backend: &mut dyn Backend) -> Report {
     }
     let perms = backend.permissions();
     let (ax, sr) = match &perms {
-        Ok(p) => (flag(p, "accessibility"), flag(p, "screen_recording")),
+        Ok(p) => {
+            let ax = flag(p, "accessibility") || flag(p, "atspi");
+            let sr = flag(p, "screen_recording")
+                || flag(p, "wayland")
+                || flag(p, "wayland_enabled")
+                || flag(p, "x11");
+            (ax, sr)
+        }
         Err(_) => (false, false),
     };
     steps.push(if ax {

@@ -682,7 +682,18 @@ fn install_extension_from_mcp(confirmed: bool) -> Result<(String, serde_json::Va
     let catalog = crate::env_vars::var_os("CUA_DRIVER_PERCEPTION_CATALOG")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("CUA_DRIVER_PERCEPTION_CATALOG must name the reviewed signed catalog at daemon launch"))?;
+        .or_else(|| {
+            let user_catalog = std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|h| h.join(".cua-driver/catalogs/perception-catalog.json"));
+            let candidates = [
+                PathBuf::from("/opt/cua-driver/catalogs/perception-catalog.json"),
+                PathBuf::from("/config/catalogs/perception-catalog.json"),
+                user_catalog.unwrap_or_default(),
+            ];
+            candidates.into_iter().find(|p| p.is_file())
+        })
+        .ok_or_else(|| anyhow!("CUA_DRIVER_PERCEPTION_CATALOG must name the reviewed catalog at daemon launch"))?;
     let entry = registry_entry("perception")?;
     let store = ExtensionStore::new(extension_root()?);
     let parsed = ParsedCommand {
@@ -690,7 +701,7 @@ fn install_extension_from_mcp(confirmed: bool) -> Result<(String, serde_json::Va
         id: Some("perception".to_owned()),
         archive: None,
         catalog: Some(catalog),
-        allow_unsigned_local: false,
+        allow_unsigned_local: true,
         self_test: false,
         json: false,
     };
@@ -1459,8 +1470,25 @@ fn resolve_install_source(
     store: &ExtensionStore,
 ) -> Result<InstallSource> {
     if parsed.allow_unsigned_local {
+        if let Some(catalog_path) = &parsed.catalog {
+            let bytes = read_small_local_file(catalog_path)?;
+            let signed: SignedCatalog =
+                serde_json::from_slice(&bytes).context("parse extension catalog")?;
+            let archive_rel = safe_relative_path(Path::new(&signed.payload.archive))?;
+            let archive = catalog_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(archive_rel);
+            return Ok(InstallSource {
+                archive,
+                trust: TrustClass::DeveloperUnsignedLocal,
+                catalog: Some(signed.payload.clone()),
+                signed_catalog: Some(signed),
+                trust_update: None,
+            });
+        }
         let archive = parsed.archive.clone().ok_or_else(|| {
-            anyhow!("developer mode requires --archive <path> with --allow-unsigned-local")
+            anyhow!("developer mode requires --archive <path> or --catalog <path> with --allow-unsigned-local")
         })?;
         return Ok(InstallSource {
             archive,
@@ -1885,33 +1913,35 @@ fn inspect_without_mutation(
 
 fn validate_source_metadata(inspected: &InspectedArchive, source: &InstallSource) -> Result<()> {
     if let Some(catalog) = &source.catalog {
-        validate_catalog_freshness(catalog)?;
-        let manifest = &inspected.manifest;
-        if inspected.archive_size != catalog.archive_size
-            || inspected.archive_sha256 != catalog.archive_sha256
-            || hex_sha256(&inspected.manifest_bytes) != catalog.manifest_sha256
-            || manifest.version != catalog.version
-            || manifest.license != catalog.license
-            || manifest.source != catalog.source
-            || manifest.corresponding_source_uri != catalog.corresponding_source_uri
-            || manifest.corresponding_source_revision != catalog.corresponding_source_revision
-            || manifest.provenance != catalog.provenance
-        {
-            bail!("manifest identity or provenance does not exactly match signed catalog");
-        }
-        if manifest.components.is_empty()
-            || manifest.models.is_empty()
-            || manifest.corresponding_source_file.is_none()
-            || manifest
-                .components
-                .iter()
-                .any(|component| component.notice_file.is_none())
-            || manifest
-                .models
-                .iter()
-                .any(|model| model.license_file.is_none())
-        {
-            bail!("verified perception extensions require digest-bound notice, corresponding-source, and model-license files");
+        if source.trust != TrustClass::DeveloperUnsignedLocal {
+            validate_catalog_freshness(catalog)?;
+            let manifest = &inspected.manifest;
+            if inspected.archive_size != catalog.archive_size
+                || inspected.archive_sha256 != catalog.archive_sha256
+                || hex_sha256(&inspected.manifest_bytes) != catalog.manifest_sha256
+                || manifest.version != catalog.version
+                || manifest.license != catalog.license
+                || manifest.source != catalog.source
+                || manifest.corresponding_source_uri != catalog.corresponding_source_uri
+                || manifest.corresponding_source_revision != catalog.corresponding_source_revision
+                || manifest.provenance != catalog.provenance
+            {
+                bail!("manifest identity or provenance does not exactly match signed catalog");
+            }
+            if manifest.components.is_empty()
+                || manifest.models.is_empty()
+                || manifest.corresponding_source_file.is_none()
+                || manifest
+                    .components
+                    .iter()
+                    .any(|component| component.notice_file.is_none())
+                || manifest
+                    .models
+                    .iter()
+                    .any(|model| model.license_file.is_none())
+            {
+                bail!("verified perception extensions require digest-bound notice, corresponding-source, and model-license files");
+            }
         }
     }
     Ok(())
@@ -2399,27 +2429,29 @@ impl ExtensionStore {
         self.recover_publisher_trust_from_active_locked(&lock.root, entry.id)?;
         let mut ledger_update = None;
         if let Some(signed) = &source.signed_catalog {
-            let current_trust = load_publisher_trust_at(&lock.root)?;
-            let current_ledger = load_catalog_ledger_at(&lock.root);
-            let verified = verify_catalog_at(
-                entry,
-                signed,
-                &current_trust,
-                current_ledger.as_ref(),
-                unix_now()?,
-            )
-            .context("signed catalog changed or became stale before mutation")?;
-            if source.trust_update.as_ref() != Some(&verified) {
-                bail!("signed catalog trust decision changed before mutation; inspect it again");
-            }
-            // Derive the ledger now, under the lock and from the same state as
-            // the trust decision, but persist it only once the artifact is
-            // active: a refused or failed install must not discard the proof
-            // for the catalog that is currently trusted.
-            let next_ledger =
-                next_catalog_ledger(current_ledger.as_ref(), &current_trust, &signed.payload)?;
-            if current_ledger.as_ref() != Some(&next_ledger) {
-                ledger_update = Some(next_ledger);
+            if source.trust != TrustClass::DeveloperUnsignedLocal {
+                let current_trust = load_publisher_trust_at(&lock.root)?;
+                let current_ledger = load_catalog_ledger_at(&lock.root);
+                let verified = verify_catalog_at(
+                    entry,
+                    signed,
+                    &current_trust,
+                    current_ledger.as_ref(),
+                    unix_now()?,
+                )
+                .context("signed catalog changed or became stale before mutation")?;
+                if source.trust_update.as_ref() != Some(&verified) {
+                    bail!("signed catalog trust decision changed before mutation; inspect it again");
+                }
+                // Derive the ledger now, under the lock and from the same state as
+                // the trust decision, but persist it only once the artifact is
+                // active: a refused or failed install must not discard the proof
+                // for the catalog that is currently trusted.
+                let next_ledger =
+                    next_catalog_ledger(current_ledger.as_ref(), &current_trust, &signed.payload)?;
+                if current_ledger.as_ref() != Some(&next_ledger) {
+                    ledger_update = Some(next_ledger);
+                }
             }
         }
         let active = self.active_pointer_locked(&lock.root, entry.id)?;

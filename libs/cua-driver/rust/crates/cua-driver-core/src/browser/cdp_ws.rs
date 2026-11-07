@@ -45,6 +45,7 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Accessibility.getFullAXTree",
     "Browser.getWindowBounds",
     "Browser.getWindowForTarget",
+    "Browser.setWindowBounds",
     "Browser.setDownloadBehavior",
     "DOM.describeNode",
     "DOM.focus",

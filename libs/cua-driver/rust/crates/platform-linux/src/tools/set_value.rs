@@ -131,16 +131,17 @@ impl Tool for SetValueTool {
         //    all, type, commit with Tab.
         let is_combo = token.observed.role.eq_ignore_ascii_case("combo box");
         let wayland = crate::wayland::wayland_input_enabled();
+        let wayland_route = wayland;
         let background_route = !delivery.is_foreground()
             && !wayland
             && crate::input::real_pointer_input_available()
             && crate::input::real_keyboard_input_available();
         let foreground_route = delivery.is_foreground() && !wayland;
-        if !background_route && !foreground_route {
+        if !background_route && !foreground_route && !wayland_route {
             let detail = format!(
                 "{ax_error}; the keyboard fallback needs {}",
                 if wayland {
-                    "an X11 session"
+                    "Wayland input enabled"
                 } else {
                     "the focus-free real-input route (a writable /dev/uinput), or delivery_mode:\"foreground\""
                 }
@@ -166,6 +167,36 @@ impl Tool for SetValueTool {
             "set_value keyboard fallback",
             foreground_budget(value.len()),
             move || -> anyhow::Result<Option<crate::input::FocusGuardReport>> {
+                if wayland_route {
+                    let coords = resolve_element_local_coords(pid, &target, xid_opt).ok();
+                    let (win, lx, ly) = coords.unwrap_or_else(|| (xid_opt.unwrap_or(0), 0.0, 0.0));
+                    let xid = if win != 0 { win } else { xid_opt.unwrap_or(0) };
+                    crate::interaction::with_target_foreground(
+                        pid,
+                        xid,
+                        crate::interaction::RestoreMode::RestorePrevious,
+                        || {
+                            let _ = crate::atspi::perform_action_observed(&target.observed);
+                            let _ = crate::atspi::focus_token(pid, &target);
+                            if win != 0 {
+                                let _ = crate::wayland::click(
+                                    win,
+                                    (lx.round() as i32, ly.round() as i32).into(),
+                                    1,
+                                    1,
+                                );
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(80));
+                            crate::wayland::hotkey_focused(&["ctrl".into(), "a".into()])?;
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            crate::wayland::type_text_focused(&value_for_keys)?;
+                            std::thread::sleep(std::time::Duration::from_millis(50));
+                            let _ = crate::wayland::press_key_focused("Tab");
+                            Ok(())
+                        },
+                    )?;
+                    return Ok(None);
+                }
                 let (win, lx, ly) = resolve_element_local_coords(pid, &target, xid_opt)?;
                 if is_combo {
                     return pick_from_popup(
@@ -222,11 +253,15 @@ impl Tool for SetValueTool {
                 set_value_result(
                     idx,
                     &value,
-                    match (is_combo, foreground_route) {
-                        (true, true) => "click_select_fg",
-                        (true, false) => "click_select_mpx",
-                        (false, true) => "click_type_fg",
-                        (false, false) => "click_type_mpx",
+                    if wayland_route {
+                        "click_type_fg"
+                    } else {
+                        match (is_combo, foreground_route) {
+                            (true, true) => "click_select_fg",
+                            (true, false) => "click_select_mpx",
+                            (false, true) => "click_type_fg",
+                            (false, false) => "click_type_mpx",
+                        }
                     },
                     readback,
                     guard.as_ref(),

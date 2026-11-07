@@ -102,6 +102,7 @@ pub enum ActionTransport {
     BrowserCdpInputMouse,
     BrowserCdpInputKey,
     BrowserCdpRuntimeFunction,
+    BrowserCdpWindowBounds,
 }
 
 impl ActionTransport {
@@ -142,6 +143,7 @@ impl ActionTransport {
         Self::BrowserCdpInputMouse,
         Self::BrowserCdpInputKey,
         Self::BrowserCdpRuntimeFunction,
+        Self::BrowserCdpWindowBounds,
     ];
 
     pub const fn route(self) -> ActionRoute {
@@ -176,9 +178,10 @@ impl ActionTransport {
             | Self::LinuxWaylandVirtualPointer
             | Self::LinuxHyprlandForegroundInput
             | Self::LinuxCuaCompositorInject => ActionRoute::GlobalInput,
-            Self::WindowsSetWindowPos | Self::LinuxX11ConfigureWindow | Self::MacosAppleEvent => {
-                ActionRoute::SystemApi
-            }
+            Self::WindowsSetWindowPos
+            | Self::LinuxX11ConfigureWindow
+            | Self::MacosAppleEvent
+            | Self::BrowserCdpWindowBounds => ActionRoute::SystemApi,
             Self::BrowserCdpRuntimeFunction => ActionRoute::Dom,
             Self::BrowserCdpInputMouse | Self::BrowserCdpInputKey => ActionRoute::TrustedInput,
         }
@@ -1153,6 +1156,7 @@ fn transport_name(transport: ActionTransport) -> &'static str {
         ActionTransport::BrowserCdpInputMouse => "browser_cdp_input_mouse",
         ActionTransport::BrowserCdpInputKey => "browser_cdp_input_key",
         ActionTransport::BrowserCdpRuntimeFunction => "browser_cdp_runtime_function",
+        ActionTransport::BrowserCdpWindowBounds => "browser_cdp_window_bounds",
     }
 }
 

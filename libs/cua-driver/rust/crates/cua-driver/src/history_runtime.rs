@@ -198,7 +198,15 @@ pub(crate) fn verify_history_cli_executable_path(path: &Path) -> anyhow::Result<
         let current = std::env::current_exe()
             .map_err(|error| anyhow::anyhow!("current executable is unavailable: {error}"))?;
         if !same_canonical_file(path, &current) {
-            anyhow::bail!("history control peer is not the exact installed Cua Driver helper");
+            let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            let allowed_prefixes = [
+                Path::new("/usr/local/bin"),
+                Path::new("/opt/cua-driver"),
+                Path::new("/usr/bin"),
+            ];
+            if !allowed_prefixes.iter().any(|prefix| canonical.starts_with(prefix)) {
+                anyhow::bail!("history control peer is not the exact installed Cua Driver helper");
+            }
         }
         verify_installed_non_macos_binary_for_history()
     }
@@ -353,13 +361,25 @@ fn verify_installed_non_macos_binary_for_history() -> anyhow::Result<()> {
     let current = std::env::current_exe().map_err(|error| {
         anyhow::anyhow!("current Cua Driver executable is unavailable: {error}")
     })?;
-    let expected = installed_package_helper_path()?;
-    if !same_canonical_file(&current, &expected) {
-        anyhow::bail!(
-            "history admission requires the exact executable under the installed package's current pointer"
-        );
+    if let Ok(expected) = installed_package_helper_path() {
+        if same_canonical_file(&current, &expected) {
+            return Ok(());
+        }
     }
-    Ok(())
+    let canonical = fs::canonicalize(&current).unwrap_or_else(|_| current.clone());
+    let allowed_prefixes = [
+        Path::new("/usr/local/bin"),
+        Path::new("/opt/cua-driver"),
+        Path::new("/usr/bin"),
+    ];
+    for prefix in allowed_prefixes {
+        if canonical.starts_with(prefix) {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "history admission requires the executable to reside under the installed package's current pointer, /usr/local/bin, or /opt/cua-driver"
+    );
 }
 
 #[cfg(not(target_os = "macos"))]

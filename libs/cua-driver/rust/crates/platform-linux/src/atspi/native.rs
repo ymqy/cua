@@ -3509,6 +3509,109 @@ fn exact_menu_path_matches(visited: &[Visited<'_>], path: &[String]) -> Vec<usiz
         .collect()
 }
 
+/// Match top-level action buttons when classic AT-SPI menu bar is absent (e.g. Chromium, GNOME CSD).
+fn action_button_matches(visited: &[Visited<'_>], target_label: &str) -> Vec<usize> {
+    let target_clean = target_label.trim();
+    let target_lower = target_clean.to_ascii_lowercase();
+
+    // 1. Exact match on name or description for button-like roles
+    let exact: Vec<usize> = visited
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            if node.enabled == Some(false) {
+                return None;
+            }
+            let role_lower = node.role.to_ascii_lowercase();
+            let is_button = role_lower.contains("button")
+                || node.actions.iter().any(|a| {
+                    let verb = normalized_action_verb(a);
+                    matches!(verb.as_str(), "press" | "click" | "open" | "dodefault" | "activate")
+                });
+            if !is_button {
+                return None;
+            }
+            let name_trim = node.name.trim();
+            let desc_trim = node.description.trim();
+            if name_trim.eq_ignore_ascii_case(target_clean)
+                || desc_trim.eq_ignore_ascii_case(target_clean)
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    // 2. Substring match: button name/desc contains label, or label contains name
+    let substring: Vec<usize> = visited
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| {
+            if node.enabled == Some(false) {
+                return None;
+            }
+            let role_lower = node.role.to_ascii_lowercase();
+            let is_button = role_lower.contains("button")
+                || node.actions.iter().any(|a| {
+                    let verb = normalized_action_verb(a);
+                    matches!(verb.as_str(), "press" | "click" | "open" | "dodefault" | "activate")
+                });
+            if !is_button {
+                return None;
+            }
+            let name_lower = node.name.trim().to_ascii_lowercase();
+            let desc_lower = node.description.trim().to_ascii_lowercase();
+            if (!name_lower.is_empty() && (name_lower.contains(&target_lower) || target_lower.contains(&name_lower)))
+                || (!desc_lower.is_empty() && (desc_lower.contains(&target_lower) || target_lower.contains(&desc_lower)))
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect();
+    if !substring.is_empty() {
+        return substring;
+    }
+
+    // 3. Common application menu buttons (hamburger menu / app menu) if label is generic like "Menu", "App", "File", "Options"
+    if matches!(target_lower.as_str(), "menu" | "app" | "main menu" | "options" | "more") {
+        let app_menus: Vec<usize> = visited
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                if node.enabled == Some(false) {
+                    return None;
+                }
+                let role_lower = node.role.to_ascii_lowercase();
+                if !role_lower.contains("button") {
+                    return None;
+                }
+                let name_lower = node.name.trim().to_ascii_lowercase();
+                let desc_lower = node.description.trim().to_ascii_lowercase();
+                if name_lower.contains("menu")
+                    || desc_lower.contains("menu")
+                    || desc_lower.contains("customize and control")
+                    || desc_lower.contains("自定义及控制")
+                {
+                    Some(index)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !app_menus.is_empty() {
+            return app_menus;
+        }
+    }
+
+    Vec::new()
+}
+
 /// Resolve and invoke an application menu one live hierarchy level at a time.
 /// Every hop re-walks AT-SPI after the preceding menu has materialized; no
 /// snapshot index is retained across mutations.
@@ -3530,6 +3633,9 @@ pub fn invoke_menu_path_in(pid: u32, xid: u64, path: &[String]) -> Result<()> {
                     .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
                 let visited = collected.visited;
                 let mut matches = exact_menu_path_matches(&visited, &path[..=depth]);
+                if matches.is_empty() && depth == 0 {
+                    matches = action_button_matches(&visited, &path[0]);
+                }
                 if matches.len() > 1 {
                     if let Some(scope) = collected.scoped_frame {
                         let scoped: Vec<usize> = matches
@@ -3554,9 +3660,17 @@ pub fn invoke_menu_path_in(pid: u32, xid: u64, path: &[String]) -> Result<()> {
                 if target.enabled == Some(false) {
                     anyhow::bail!("menu path segment {depth} is disabled");
                 }
-                let chosen = activation_index(&target.role, &target.actions).ok_or_else(|| {
-                    anyhow!("menu path segment {depth} has no safe activation action")
-                })?;
+                let chosen = activation_index(&target.role, &target.actions)
+                    .or_else(|| {
+                        if target.role.to_ascii_lowercase().contains("button") && !target.actions.is_empty() {
+                            Some(0)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| {
+                        anyhow!("menu path segment {depth} has no safe activation action")
+                    })?;
                 let proxies = target
                     .acc
                     .proxies()

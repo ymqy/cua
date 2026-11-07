@@ -3,9 +3,154 @@
 
 //! Linux adapters for encrypted Computer History.
 
-use cua_driver_core::history::{ApplicationIdentity, ApplicationIdentityProvider};
-pub use cua_driver_core::history_keyring::KeyringKeyProvider as LinuxSecretServiceKeyProvider;
+use cua_driver_core::history::{
+    ApplicationIdentity, ApplicationIdentityProvider, HistoryError, HistoryHealthCategory,
+    HistoryKey, KeyProvider,
+};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use zeroize::Zeroizing;
+
+#[derive(Default)]
+pub struct LinuxSecretServiceKeyProvider {
+    inner: cua_driver_core::history_keyring::KeyringKeyProvider,
+}
+
+impl LinuxSecretServiceKeyProvider {
+    pub fn shared() -> Arc<Self> {
+        Arc::new(Self {
+            inner: cua_driver_core::history_keyring::KeyringKeyProvider,
+        })
+    }
+
+    fn fallback_key_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("CUA_DRIVER_HISTORY_KEY_DIR") {
+            return PathBuf::from(dir);
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".cua-driver").join("history_keys")
+    }
+
+    fn fallback_key_path(namespace: &str) -> PathBuf {
+        Self::fallback_key_dir().join(format!("{namespace}.key"))
+    }
+
+    fn read_file_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, HistoryError> {
+        let bytes = fs::read(path).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        if bytes.len() != 32 {
+            return Err(HistoryError::new(HistoryHealthCategory::KeyCorrupt));
+        }
+        Ok(Zeroizing::new(bytes))
+    }
+
+    fn write_file_key(path: &Path, bytes: &[u8]) -> Result<(), HistoryError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
+        }
+        let temp_path = path.with_extension("tmp");
+        let mut options = fs::OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write;
+        let mut file = options.open(&temp_path).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        file.write_all(bytes).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        file.sync_data().map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        fs::rename(temp_path, path).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        Ok(())
+    }
+}
+
+impl KeyProvider for LinuxSecretServiceKeyProvider {
+    fn load_or_create(&self, namespace: &str) -> Result<HistoryKey, HistoryError> {
+        match self.inner.load_or_create(namespace) {
+            Ok(key) => Ok(key),
+            Err(_) => {
+                let path = Self::fallback_key_path(namespace);
+                if path.is_file() {
+                    let bytes = Self::read_file_key(&path)?;
+                    return Ok(HistoryKey {
+                        reference: format!("file:{}", path.display()),
+                        epoch: 0,
+                        bytes,
+                    });
+                }
+                let mut bytes = Zeroizing::new(vec![0_u8; 32]);
+                getrandom::fill(&mut bytes).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+                Self::write_file_key(&path, &bytes)?;
+                Ok(HistoryKey {
+                    reference: format!("file:{}", path.display()),
+                    epoch: 0,
+                    bytes,
+                })
+            }
+        }
+    }
+
+    fn load(&self, namespace: &str, reference: &str) -> Result<HistoryKey, HistoryError> {
+        if let Some(path_str) = reference.strip_prefix("file:") {
+            let path = PathBuf::from(path_str);
+            let bytes = Self::read_file_key(&path)?;
+            return Ok(HistoryKey {
+                reference: reference.to_owned(),
+                epoch: 0,
+                bytes,
+            });
+        }
+        match self.inner.load(namespace, reference) {
+            Ok(key) => Ok(key),
+            Err(_) => {
+                let path = Self::fallback_key_path(namespace);
+                if path.is_file() {
+                    let bytes = Self::read_file_key(&path)?;
+                    return Ok(HistoryKey {
+                        reference: format!("file:{}", path.display()),
+                        epoch: 0,
+                        bytes,
+                    });
+                }
+                Err(HistoryError::new(HistoryHealthCategory::KeyUnavailable))
+            }
+        }
+    }
+
+    fn references(&self, namespace: &str) -> Result<Vec<String>, HistoryError> {
+        let mut refs = self.inner.references(namespace).unwrap_or_default();
+        let path = Self::fallback_key_path(namespace);
+        if path.is_file() {
+            let file_ref = format!("file:{}", path.display());
+            if !refs.contains(&file_ref) {
+                refs.push(file_ref);
+            }
+        }
+        Ok(refs)
+    }
+
+    fn destroy(&self, namespace: &str, reference: &str) -> Result<(), HistoryError> {
+        let _ = self.inner.destroy(namespace, reference);
+        if let Some(path_str) = reference.strip_prefix("file:") {
+            let path = PathBuf::from(path_str);
+            let _ = fs::remove_file(path);
+        } else {
+            let path = Self::fallback_key_path(namespace);
+            if path.is_file() {
+                let _ = fs::remove_file(path);
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Default)]
 pub struct LinuxApplicationIdentityProvider;

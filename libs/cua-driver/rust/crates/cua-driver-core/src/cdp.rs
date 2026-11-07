@@ -166,19 +166,14 @@ async fn cdp_wait_for_page(port: u16) -> anyhow::Result<Vec<Value>> {
     }
 }
 
-async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
+async fn cdp_http_get(port: u16, path: &str) -> anyhow::Result<Value> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .map_err(|e| anyhow::anyhow!("Cannot connect to CDP on port {port}: {e}"))?;
 
-    // `Connection: close` would be ideal but Chromium's CDP HTTP server
-    // ignores it and keeps the socket alive — a `read_to_end` then hangs
-    // forever. Parse Content-Length / Transfer-Encoding: chunked from the
-    // response headers and read exactly that many body bytes, leaving the
-    // socket open (it's torn down when we drop the stream).
-    let req = format!("GET /json HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes()).await?;
 
     let mut reader = BufReader::new(stream);
@@ -189,7 +184,7 @@ async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
         header_line.clear();
         let n = reader.read_line(&mut header_line).await?;
         if n == 0 {
-            anyhow::bail!("CDP /json: EOF in headers");
+            anyhow::bail!("CDP {path}: EOF in headers");
         }
         if header_line == "\r\n" {
             break;
@@ -213,7 +208,7 @@ async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
             let mut size_line = String::new();
             reader.read_line(&mut size_line).await?;
             let size = usize::from_str_radix(size_line.trim_end(), 16)
-                .map_err(|_| anyhow::anyhow!("CDP /json: bad chunk size {size_line:?}"))?;
+                .map_err(|_| anyhow::anyhow!("CDP {path}: bad chunk size {size_line:?}"))?;
             if size == 0 {
                 break;
             }
@@ -225,19 +220,19 @@ async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
         }
         out
     } else {
-        // No Content-Length and not chunked — fall back to read-until-EOF.
-        // Server will close eventually if it actually honoured our
-        // Connection: close header.
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await?;
         buf
     };
 
     let body = std::str::from_utf8(&body_bytes)
-        .map_err(|_| anyhow::anyhow!("CDP /json response is not valid UTF-8"))?;
+        .map_err(|_| anyhow::anyhow!("CDP {path} response is not valid UTF-8"))?;
 
-    let all: Value =
-        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("CDP /json parse error: {e}"))?;
+    serde_json::from_str(body).map_err(|e| anyhow::anyhow!("CDP {path} parse error: {e}"))
+}
+
+async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
+    let all = cdp_http_get(port, "/json").await?;
 
     let pages = all
         .as_array()
@@ -264,6 +259,75 @@ async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
         .collect();
 
     Ok(pages)
+}
+
+/// Adjust Chromium window geometry via CDP Browser.setWindowBounds.
+/// Returns the verified (x, y, width, height) read back from Browser.getWindowBounds.
+pub async fn set_window_bounds_via_cdp(
+    port: u16,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> anyhow::Result<(i32, i32, u32, u32)> {
+    let version_info = cdp_http_get(port, "/json/version").await?;
+    let browser_ws_url = version_info
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("CDP /json/version has no webSocketDebuggerUrl on port {port}"))?;
+
+    let pages = cdp_wait_for_page(port).await?;
+    let first_page = pages
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("No active CDP pages on port {port}"))?;
+    let target_id = first_page
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("CDP page target has no id"))?;
+
+    let conn = legacy_pool().get(browser_ws_url).await?;
+
+    let window_resp = conn
+        .call(
+            None,
+            "Browser.getWindowForTarget",
+            serde_json::json!({ "targetId": target_id }),
+        )
+        .await?;
+    let window_id = window_resp
+        .get("windowId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("Browser.getWindowForTarget did not return windowId"))?;
+
+    let bounds_params = serde_json::json!({
+        "windowId": window_id,
+        "bounds": {
+            "left": x,
+            "top": y,
+            "width": width,
+            "height": height,
+            "windowState": "normal"
+        }
+    });
+    conn.call(None, "Browser.setWindowBounds", bounds_params).await?;
+
+    let readback_resp = conn
+        .call(
+            None,
+            "Browser.getWindowBounds",
+            serde_json::json!({ "windowId": window_id }),
+        )
+        .await?;
+    let bounds = readback_resp
+        .get("bounds")
+        .ok_or_else(|| anyhow::anyhow!("Browser.getWindowBounds returned no bounds"))?;
+
+    let actual_x = bounds.get("left").and_then(Value::as_i64).unwrap_or(x as i64) as i32;
+    let actual_y = bounds.get("top").and_then(Value::as_i64).unwrap_or(y as i64) as i32;
+    let actual_w = bounds.get("width").and_then(Value::as_u64).unwrap_or(width as u64) as u32;
+    let actual_h = bounds.get("height").and_then(Value::as_u64).unwrap_or(height as u64) as u32;
+
+    Ok((actual_x, actual_y, actual_w, actual_h))
 }
 
 #[cfg(test)]
