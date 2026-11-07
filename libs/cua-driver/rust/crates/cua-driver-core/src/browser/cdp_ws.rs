@@ -45,8 +45,8 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Accessibility.getFullAXTree",
     "Browser.getWindowBounds",
     "Browser.getWindowForTarget",
-    "Browser.setWindowBounds",
     "Browser.setDownloadBehavior",
+    "Browser.setWindowBounds",
     "DOM.describeNode",
     "DOM.focus",
     "DOM.getBoxModel",
@@ -544,6 +544,39 @@ pub async fn close_parked_browser_sockets() -> usize {
         closed += pool.close_parked().await;
     }
     closed
+}
+
+/// Find an open, live CdpConnection for the given endpoint URL or loopback port
+/// across all active pools in this process.
+///
+/// Used by browser-level window management (e.g. set_window_bounds_via_cdp)
+/// to reuse an existing consented/grant-owned socket without dialing a new
+/// socket or triggering browser consent prompts.
+pub async fn find_live_endpoint_connection(ws_url: &str) -> Option<Arc<CdpConnection>> {
+    let target_port = loopback_port(ws_url);
+    let pools: Vec<Arc<PoolInner>> = {
+        let mut pools = live_pools().lock().unwrap();
+        pools.retain(|pool| pool.strong_count() > 0);
+        pools.iter().filter_map(Weak::upgrade).collect()
+    };
+    for pool in pools {
+        let conns = pool.conns.lock().await;
+        // 1. Exact URL match
+        if let Some(entry) = conns.get(ws_url) {
+            if !entry.conn.is_closed() {
+                return Some(entry.conn.clone());
+            }
+        }
+        // 2. Loopback port match fallback
+        if let Some(port) = target_port {
+            for (url, entry) in conns.iter() {
+                if loopback_port(url) == Some(port) && !entry.conn.is_closed() {
+                    return Some(entry.conn.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Per-pool record of which endpoint URLs are grant-owned, so the global
@@ -1609,4 +1642,27 @@ mod tests {
             .await;
         log("session C: ended; socket closed");
     }
+
+    #[test]
+    fn test_existing_profile_methods_sorted_and_allowed() {
+        for window in EXISTING_PROFILE_METHODS.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "EXISTING_PROFILE_METHODS not sorted: {:?} >= {:?}",
+                window[0],
+                window[1]
+            );
+        }
+        let policy = CdpMethodPolicy::ExistingProfile;
+        for &method in EXISTING_PROFILE_METHODS {
+            assert!(
+                policy.allows(method),
+                "ExistingProfile policy must allow {method}"
+            );
+        }
+        assert!(policy.allows("Browser.setWindowBounds"));
+        assert!(policy.allows("Browser.setDownloadBehavior"));
+        assert!(!policy.allows("Page.setDocumentContent"));
+    }
 }
+

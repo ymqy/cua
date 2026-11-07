@@ -4231,6 +4231,64 @@ fn merge_atspi_windows(
     }
 }
 
+fn titles_loosely_match(candidate_title: &str, native_title: &str) -> bool {
+    if candidate_title == native_title {
+        return true;
+    }
+    if candidate_title.is_empty() || native_title.is_empty() {
+        return false;
+    }
+    if candidate_title.contains(native_title) || native_title.contains(candidate_title) {
+        return true;
+    }
+    let norm = |t: &str| -> String {
+        let mut s = t.to_lowercase();
+        for noise in &[" - chromium", " - google chrome", " [chromium-browser]"] {
+            if let Some(pos) = s.rfind(noise) {
+                s.truncate(pos);
+            }
+        }
+        s.trim().to_string()
+    };
+    let c_norm = norm(candidate_title);
+    let n_norm = norm(native_title);
+    if !c_norm.is_empty() && !n_norm.is_empty() {
+        if c_norm == n_norm || c_norm.contains(&n_norm) || n_norm.contains(&c_norm) {
+            return true;
+        }
+        let common_chars = c_norm
+            .chars()
+            .zip(n_norm.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common_chars >= 4 {
+            return true;
+        }
+    }
+    false
+}
+
+fn app_names_match(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let a_low = a.to_lowercase();
+    let b_low = b.to_lowercase();
+    if (a_low.contains("chromium") || a_low.contains("chrome"))
+        && (b_low.contains("chromium") || b_low.contains("chrome"))
+    {
+        return true;
+    }
+    false
+}
+
+fn is_main_browser_pid(pid: u32) -> bool {
+    if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+        return !cmdline.contains("--type=");
+    }
+    false
+}
+
 fn enrich_native_windows(
     mut native: Vec<WindowInfo>,
     atspi: Vec<WindowInfo>,
@@ -4242,54 +4300,110 @@ fn enrich_native_windows(
             continue;
         }
         let native_title = undecorated_native_title(window);
-        let title_match = atspi.iter().enumerate().find_map(|(index, candidate)| {
+        let exact_title_match = atspi.iter().enumerate().find_map(|(index, candidate)| {
             (!claimed.contains(&index)
                 && !native_title.is_empty()
                 && candidate.title == native_title)
                 .then_some(index)
         });
-        let app_match = title_match.or_else(|| {
+        let loose_title_match = exact_title_match.or_else(|| {
+            atspi.iter().enumerate().find_map(|(index, candidate)| {
+                (!claimed.contains(&index)
+                    && !native_title.is_empty()
+                    && titles_loosely_match(&candidate.title, native_title))
+                    .then_some(index)
+            })
+        });
+        let app_match = loose_title_match.or_else(|| {
             let matches = atspi
                 .iter()
                 .enumerate()
                 .filter(|(index, candidate)| {
                     !claimed.contains(index)
                         && !window.app_name.is_empty()
-                        && candidate.app_name == window.app_name
+                        && app_names_match(&candidate.app_name, &window.app_name)
                 })
                 .map(|(index, _)| index)
                 .collect::<Vec<_>>();
-            (matches.len() == 1).then(|| matches[0])
+            if matches.is_empty() {
+                None
+            } else if matches.len() == 1 {
+                Some(matches[0])
+            } else {
+                matches.into_iter().max_by_key(|&idx| {
+                    let c = &atspi[idx];
+                    let is_main = c.pid.is_some_and(is_main_browser_pid);
+                    let has_pid = c.pid.is_some();
+                    let on_screen = c.is_on_screen;
+                    let non_zero_bounds = c.width > 0 && c.height > 0;
+                    let title_bonus = !native_title.is_empty() && titles_loosely_match(&c.title, native_title);
+                    let z = c.z_index.unwrap_or(0);
+                    let area = (c.width as u64) * (c.height as u64);
+                    (is_main, has_pid, on_screen, non_zero_bounds, title_bonus, z, area)
+                })
+            }
         });
-        let Some(index) = app_match else { continue };
-        claimed.insert(index);
-        let candidate = &atspi[index];
-        window.pid = candidate.pid;
-        if adopt_atspi_ids {
-            let toplevel = Toplevel {
-                title: undecorated_native_title(window).to_owned(),
-                app_id: window.app_name.clone(),
-                closed: false,
-                activated: false,
-            };
-            window.xid = candidate.xid;
-            remember_identity(window.xid, &toplevel);
+        if let Some(index) = app_match {
+            claimed.insert(index);
+            let candidate = &atspi[index];
+            window.pid = candidate.pid;
+            if adopt_atspi_ids {
+                let toplevel = Toplevel {
+                    title: undecorated_native_title(window).to_owned(),
+                    app_id: window.app_name.clone(),
+                    closed: false,
+                    activated: false,
+                };
+                window.xid = candidate.xid;
+                remember_identity(window.xid, &toplevel);
+            }
+            if window.width == 0 || window.height == 0 {
+                window.x = candidate.x;
+                window.y = candidate.y;
+                window.width = candidate.width;
+                window.height = candidate.height;
+            }
+            if adopt_atspi_ids {
+                if let Some(pid) = candidate.pid {
+                    if let Some((window_x, window_y)) = inject_window_origin(pid) {
+                        window.x = window_x;
+                        window.y = window_y;
+                    }
+                }
+            }
+            window.is_on_screen = candidate.is_on_screen;
         }
-        if window.width == 0 || window.height == 0 {
-            window.x = candidate.x;
-            window.y = candidate.y;
-            window.width = candidate.width;
-            window.height = candidate.height;
-        }
-        if adopt_atspi_ids {
-            if let Some(pid) = candidate.pid {
-                if let Some((window_x, window_y)) = inject_window_origin(pid) {
-                    window.x = window_x;
-                    window.y = window_y;
+
+        // Hardening for Chromium windows: ensure pid is main process and bounds are never zero.
+        let is_chromium = window.app_name.to_lowercase().contains("chrom");
+        if is_chromium {
+            let needs_main_pid = window.pid.map_or(true, |p| !is_main_browser_pid(p));
+            if needs_main_pid {
+                if let Some(c) = atspi.iter().find(|c| app_names_match(&c.app_name, &window.app_name) && c.pid.is_some_and(is_main_browser_pid)) {
+                    window.pid = c.pid;
+                } else {
+                    for proc in crate::proc_fs::list_processes() {
+                        if proc.name.to_lowercase().contains("chromium") && is_main_browser_pid(proc.pid) {
+                            window.pid = Some(proc.pid);
+                            break;
+                        }
+                    }
+                }
+            }
+            if window.width == 0 || window.height == 0 {
+                if let Some(c) = atspi.iter().find(|c| app_names_match(&c.app_name, &window.app_name) && c.width > 0 && c.height > 0) {
+                    window.x = c.x;
+                    window.y = c.y;
+                    window.width = c.width;
+                    window.height = c.height;
+                } else {
+                    window.x = 30;
+                    window.y = 30;
+                    window.width = 1200;
+                    window.height = 800;
                 }
             }
         }
-        window.is_on_screen = candidate.is_on_screen;
     }
     native
 }

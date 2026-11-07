@@ -142,11 +142,11 @@ pub fn escalate_session(
         return Err(EscalateError::NotStarted);
     };
     if state.desktop_unlocked {
-        return Err(EscalateError::DesktopAlreadyActive);
+        return Ok(state.clone());
     }
     match state.policy {
         CaptureScopePolicy::Window => return Err(EscalateError::WindowStrict),
-        CaptureScopePolicy::Desktop => return Err(EscalateError::DesktopAlreadyActive),
+        CaptureScopePolicy::Desktop => return Ok(state.clone()),
         CaptureScopePolicy::Auto => {}
     }
     state.desktop_unlocked = true;

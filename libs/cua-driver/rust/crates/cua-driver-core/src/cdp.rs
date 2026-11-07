@@ -285,7 +285,14 @@ pub async fn set_window_bounds_via_cdp(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("CDP page target has no id"))?;
 
-    let conn = legacy_pool().get(browser_ws_url).await?;
+    let conn = if let Some(live) = crate::browser::cdp_ws::find_live_endpoint_connection(browser_ws_url).await {
+        live
+    } else {
+        match crate::browser::cdp_ws::CdpConnection::connect(browser_ws_url).await {
+            Ok(c) => std::sync::Arc::new(c),
+            Err(_) => legacy_pool().get(browser_ws_url).await?,
+        }
+    };
 
     let window_resp = conn
         .call(

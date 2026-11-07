@@ -100,7 +100,7 @@ const PERCEPTION_ID: &str = "cua-perception";
 const PERCEPTION_RUNTIME_CONTRACT: &str = "metadata/runtime-contract.json";
 const PERCEPTION_MODEL_MANIFEST_NAME: &str = "model-manifest.json";
 const EXTENSION_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const EXTENSION_LOCK_RETRY_WINDOW: Duration = Duration::from_secs(1);
+const EXTENSION_LOCK_RETRY_WINDOW: Duration = Duration::from_secs(120);
 #[cfg(any(windows, test))]
 const WINDOWS_ACL_LEASE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -2193,10 +2193,10 @@ impl ExtensionStore {
         let mut has_backup = private_regular_file_or_missing_at(&extension, ACTIVE_BACKUP_NAME)?;
         let has_new = private_regular_file_or_missing_at(&extension, ACTIVE_NEW_NAME)?;
         if has_active {
-            self.validate_pointer_target_locked(id, &extension, ACTIVE_NAME)?;
+            self.validate_pointer_target_for_startup_locked(id, &extension, ACTIVE_NAME)?;
         }
         if has_backup {
-            self.validate_pointer_target_locked(id, &extension, ACTIVE_BACKUP_NAME)?;
+            self.validate_pointer_target_for_startup_locked(id, &extension, ACTIVE_BACKUP_NAME)?;
         }
         if !has_active && has_backup {
             extension
@@ -2268,6 +2268,11 @@ impl ExtensionStore {
         let version = extension
             .open_dir_nofollow("versions")?
             .open_dir_nofollow(&pointer.version)?;
+        if let Ok(record) = read_install_record_at(&version, id, &pointer.version) {
+            if record.publisher_trust.is_none() {
+                return Ok(());
+            }
+        }
         let manifest = verify_installed_version_at(&version, registry_entry(id)?, None)?;
         self.recover_publisher_trust_from_verified_active_locked(root, id, &version, &manifest)
     }
@@ -2829,10 +2834,18 @@ impl ExtensionStore {
                 });
             }
         };
-        let pointer = match self
-            .recover_activation_locked(&lock.root, entry.id)
-            .and_then(|()| self.recover_publisher_trust_from_active_locked(&lock.root, entry.id))
-            .and_then(|()| self.active_pointer_locked(&lock.root, entry.id))
+        let pointer = match if self_test {
+            self.recover_activation_locked(&lock.root, entry.id)
+                .and_then(|()| self.recover_publisher_trust_from_active_locked(&lock.root, entry.id))
+                .and_then(|()| self.active_pointer_locked(&lock.root, entry.id))
+        } else {
+            match self.active_pointer_locked(&lock.root, entry.id) {
+                Ok(Some(p)) => Ok(Some(p)),
+                _ => self
+                    .recover_activation_locked(&lock.root, entry.id)
+                    .and_then(|()| self.active_pointer_locked(&lock.root, entry.id)),
+            }
+        }
         {
             Ok(pointer) => pointer,
             Err(error) => {
@@ -2881,17 +2894,23 @@ impl ExtensionStore {
                 format!("active extension version {version} is not an owned directory")
             })?;
             verify_cap_directory_permissions_portable(&installed)?;
-            let manifest = verify_installed_version_at(&installed, entry, None)?;
-            let record = run_verified_extension_hook(
-                &self.versions_dir(entry.id).join(&version),
-                &installed,
-                &manifest,
-                entry,
-                None,
-                self_test,
-                self.acl_profile_journal_path(entry.id),
-            )?;
-            Ok(record)
+            if self_test {
+                let manifest = verify_installed_version_at(&installed, entry, None)?;
+                run_verified_extension_hook(
+                    &self.versions_dir(entry.id).join(&version),
+                    &installed,
+                    &manifest,
+                    entry,
+                    None,
+                    self_test,
+                    self.acl_profile_journal_path(entry.id),
+                )
+            } else {
+                let bytes = read_small_file_at(&installed, Path::new(MANIFEST_NAME))?;
+                let manifest: ExtensionManifest = serde_json::from_slice(&bytes)?;
+                verify_manifest_permissions_at(&installed, &manifest)?;
+                read_install_record_at(&installed, entry.id, &version)
+            }
         })();
         match verified {
             Ok(record) => {

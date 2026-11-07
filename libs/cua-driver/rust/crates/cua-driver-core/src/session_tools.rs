@@ -248,9 +248,8 @@ impl Tool for StartSessionTool {
                 }
             }
         } else {
-            get_session(&id).unwrap_or_else(|| {
-                crate::capture_scope::SessionCaptureScope::new(CaptureScope::Auto)
-            })
+            crate::capture_scope::clear_session(&id);
+            crate::capture_scope::SessionCaptureScope::new(CaptureScope::Auto)
         };
         // Platform overlays keep their own late-command tombstones. Clear
         // those only after core revival and capture-policy binding both
@@ -874,7 +873,9 @@ mod tests {
         let twice = EscalateSessionTool
             .invoke(json!({"session": id, "reason": "other"}))
             .await;
-        assert_eq!(twice.is_error, Some(true));
-        assert_eq!(result_code(&twice), Some("desktop_already_active"));
+        assert_ne!(twice.is_error, Some(true));
+        let twice_structured = twice.structured_content.as_ref().unwrap();
+        assert_eq!(twice_structured["effective_scope"], "desktop");
+        assert_eq!(twice_structured["desktop_unlocked"], true);
     }
 }

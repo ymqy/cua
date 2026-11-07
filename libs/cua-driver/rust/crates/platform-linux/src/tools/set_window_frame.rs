@@ -23,6 +23,10 @@ fn detect_cdp_port(pid: Option<u32>) -> Option<u16> {
                     }
                 }
             }
+            let is_chrom = cmdline.to_lowercase().contains("chrom") || cmdline.contains("electron");
+            if !is_chrom && !crate::tools::impl_::is_chromium_embedder(pid) {
+                return None;
+            }
         }
     }
     for port in [9223, 9222] {
