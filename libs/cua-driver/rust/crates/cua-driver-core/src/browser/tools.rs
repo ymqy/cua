@@ -747,7 +747,8 @@ impl Tool for GetBrowserStateTool {
                     "binding_route": binding_route,
                     "endpoint_transport": record.endpoint_transport,
                     "endpoint_access_class": record.endpoint_access_class,
-                    "mutation_allowed": record.quality == BindingQuality::Exact,
+                    "mutation_allowed": record.quality == BindingQuality::Exact
+                        || (crate::browser::binding::is_wayland_session() && record.tabs.len() == 1),
                     "native_title": record.native_title,
                     "tabs": tabs,
                 }))

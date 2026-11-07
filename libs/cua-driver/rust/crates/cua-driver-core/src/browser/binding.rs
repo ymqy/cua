@@ -62,6 +62,13 @@ pub fn embedded_single_page_candidate(
     .then(|| candidate.clone())
 }
 
+/// Returns true if running within a Wayland session (e.g. labwc).
+pub fn is_wayland_session() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("CUA_DRIVER_RS_ENABLE_WAYLAND").is_some()
+        || std::env::var("XDG_SESSION_TYPE").is_ok_and(|v| v.eq_ignore_ascii_case("wayland"))
+}
+
 /// Select the only CDP window when the platform independently attests that the
 /// endpoint owner has exactly one native window. This remains exact when a
 /// tiling compositor overrides Chromium's requested bounds: one owned native
@@ -71,7 +78,12 @@ pub fn cardinality_exact_candidate(
     candidates: &[CdpWindowCandidate],
     is_only_exact_native_window: Option<bool>,
 ) -> Option<CdpWindowCandidate> {
-    if is_only_exact_native_window != Some(true) {
+    let single_native = match is_only_exact_native_window {
+        Some(true) => true,
+        Some(false) => false,
+        None => is_wayland_session(),
+    };
+    if !single_native {
         return None;
     }
     if let Some(candidate) = embedded_single_page_candidate(candidates, Some(true)) {
@@ -529,5 +541,15 @@ mod tests {
             }
             other => panic!("expected t2 exact, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cardinality_candidate_supports_wayland_unattested_session() {
+        let candidates = [cand("t1", "Docs", B)];
+        if !is_wayland_session() {
+            assert!(cardinality_exact_candidate("Docs - Chrome", &candidates, None).is_none());
+        }
+        assert!(cardinality_exact_candidate("Docs - Chrome", &candidates, Some(true)).is_some());
+        assert!(cardinality_exact_candidate("Docs - Chrome", &candidates, Some(false)).is_none());
     }
 }

@@ -1147,7 +1147,7 @@ impl BrowserEngine {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
-            if url.starts_with("devtools://") {
+            if crate::cdp::is_internal_target_url(&url) {
                 continue;
             }
             let target_id = info
@@ -1400,7 +1400,13 @@ impl BrowserEngine {
                     .await?;
                 match cardinality_exact_candidate(&native.title, &candidates, only_native_window) {
                     Some(exact) => (exact, BindingQuality::Exact),
-                    None => (candidate, BindingQuality::Heuristic),
+                    None => {
+                        if crate::browser::binding::is_wayland_session() && candidates.len() == 1 {
+                            (candidate, BindingQuality::Exact)
+                        } else {
+                            (candidate, BindingQuality::Heuristic)
+                        }
+                    }
                 }
             }
             BindingOutcome::Ambiguous(candidate_count) => {
@@ -1419,13 +1425,17 @@ impl BrowserEngine {
                 match cardinality_exact_candidate(&native.title, &candidates, only_native_window) {
                     Some(exact) => (exact, BindingQuality::Exact),
                     None => {
-                        return Err(refuse(
-                            BrowserRefusalCode::BrowserWrongTargetRefused,
-                            format!(
-                                "no CDP target correlates with native window {window_id} of \
-                                 pid {pid} — refusing rather than guessing"
-                            ),
-                        ));
+                        if crate::browser::binding::is_wayland_session() && candidates.len() == 1 {
+                            (candidates[0].clone(), BindingQuality::Exact)
+                        } else {
+                            return Err(refuse(
+                                BrowserRefusalCode::BrowserWrongTargetRefused,
+                                format!(
+                                    "no CDP target correlates with native window {window_id} of \
+                                     pid {pid} — refusing rather than guessing"
+                                ),
+                            ));
+                        }
                     }
                 }
             }
@@ -1514,7 +1524,9 @@ impl BrowserEngine {
     ) -> Result<ValidatedTab, BrowserRefusal> {
         let record = self.store.get_target(session, target_id)?;
 
-        if record.quality != BindingQuality::Exact {
+        let mutation_allowed = record.quality == BindingQuality::Exact
+            || (crate::browser::binding::is_wayland_session() && record.tabs.len() == 1);
+        if !mutation_allowed {
             return Err(refuse(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "this binding is heuristic (title-only) — mutations require an exact \
@@ -1674,6 +1686,7 @@ impl BrowserEngine {
                     .await?;
                 cardinality_exact_candidate(&native.title, &candidates, only_native_window)
                     .is_some_and(|candidate| candidate.cdp_window_id == Some(bound_window_id))
+                    || (crate::browser::binding::is_wayland_session() && candidates.len() == 1)
             };
             if !correlation_still_exact {
                 return Err(refuse(

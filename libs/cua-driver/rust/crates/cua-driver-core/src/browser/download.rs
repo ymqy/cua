@@ -29,6 +29,17 @@ use super::store::BrowserActionKind;
 /// It is intentionally absent from the public input schema.
 pub const MCP_HOST_DOWNLOAD_APPROVAL_ARG: &str = "_cua_browser_download_mcp_host_approved";
 
+/// Returns true if download approval is bypassed (e.g. running with --dangerously-bypass-approvals / unrestricted permission mode).
+pub fn download_approval_bypassed() -> bool {
+    crate::authorization::configured_permission_mode()
+        .map(|mode| mode == crate::authorization::PermissionMode::Unrestricted)
+        .unwrap_or(false)
+        || std::env::var(crate::authorization::DANGEROUS_BYPASS_ENV)
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        || std::env::var(crate::authorization::PERMISSION_MODE_ENV)
+            .is_ok_and(|v| v.eq_ignore_ascii_case("unrestricted") || v.eq_ignore_ascii_case("yolo"))
+}
+
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn browser_download_gate() -> &'static tokio::sync::Mutex<()> {
@@ -296,10 +307,11 @@ impl Tool for BrowserDownloadTool {
             | (_, _, _, _, Err(error)) => return error,
         };
 
-        if args
-            .get(MCP_HOST_DOWNLOAD_APPROVAL_ARG)
-            .and_then(Value::as_bool)
-            != Some(true)
+        if !download_approval_bypassed()
+            && args
+                .get(MCP_HOST_DOWNLOAD_APPROVAL_ARG)
+                .and_then(Value::as_bool)
+                != Some(true)
         {
             return consent_required();
         }
@@ -590,5 +602,16 @@ mod tests {
             download_path_for_cdp(Path::new(r"\\?\UNC\server\share\downloads")),
             r"\\server\share\downloads"
         );
+    }
+
+    #[test]
+    fn download_approval_bypassed_test() {
+        // Without env vars set, download_approval_bypassed reflects standard mode
+        let current = download_approval_bypassed();
+        // If DANGEROUS_BYPASS_ENV is set, it returns true
+        std::env::set_var(crate::authorization::DANGEROUS_BYPASS_ENV, "1");
+        assert!(download_approval_bypassed());
+        std::env::remove_var(crate::authorization::DANGEROUS_BYPASS_ENV);
+        assert_eq!(download_approval_bypassed(), current);
     }
 }

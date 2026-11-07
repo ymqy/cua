@@ -147,6 +147,13 @@ fn format_cdp_result(response: &Value) -> String {
     response.to_string()
 }
 
+/// Returns true if the CDP target URL is internal (e.g. omnibox popup, untrusted UI, or devtools).
+pub fn is_internal_target_url(url: &str) -> bool {
+    url.starts_with("chrome://omnibox-popup")
+        || url.starts_with("chrome-untrusted://")
+        || url.starts_with("devtools://")
+}
+
 // ── HTTP page discovery ───────────────────────────────────────────────────
 
 async fn cdp_wait_for_page(port: u16) -> anyhow::Result<Vec<Value>> {
@@ -237,10 +244,21 @@ async fn cdp_list_pages(port: u16) -> anyhow::Result<Vec<Value>> {
         .ok_or_else(|| anyhow::anyhow!("CDP /json is not a JSON array"))?
         .iter()
         .filter(|p| {
-            p.get("type").and_then(|t| t.as_str()) == Some("page")
-                && p.get("webSocketDebuggerUrl")
-                    .and_then(|u| u.as_str())
-                    .is_some()
+            if p.get("type").and_then(|t| t.as_str()) != Some("page") {
+                return false;
+            }
+            if p.get("webSocketDebuggerUrl")
+                .and_then(|u| u.as_str())
+                .is_none()
+            {
+                return false;
+            }
+            if let Some(url) = p.get("url").and_then(|u| u.as_str()) {
+                if is_internal_target_url(url) {
+                    return false;
+                }
+            }
+            true
         })
         .cloned()
         .collect();
@@ -357,5 +375,15 @@ mod tests {
 
         assert_eq!(evaluate(port, "1 + 1", true).await.unwrap(), "\"compat\"");
         server.await.unwrap();
+    }
+
+    #[test]
+    fn internal_target_urls_are_filtered() {
+        assert!(super::is_internal_target_url("chrome://omnibox-popup.top-chrome/"));
+        assert!(super::is_internal_target_url("chrome-untrusted://new-tab-page/one-google-bar"));
+        assert!(super::is_internal_target_url("devtools://devtools/bundled/devtools_app.html"));
+        assert!(!super::is_internal_target_url("https://example.com"));
+        assert!(!super::is_internal_target_url("chrome://newtab/"));
+        assert!(!super::is_internal_target_url("about:blank"));
     }
 }
