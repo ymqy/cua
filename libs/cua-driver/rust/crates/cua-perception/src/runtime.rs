@@ -12,6 +12,7 @@ use std::{
 use image::{Rgb, RgbImage};
 use libloading::Library;
 use ort::{
+    environment::GlobalThreadPoolOptions,
     session::{builder::GraphOptimizationLevel, Session},
     tensor::TensorElementType,
     value::Tensor,
@@ -66,14 +67,28 @@ impl OnnxBackend {
     pub fn load(validated: ValidatedManifest) -> Result<Self, InferenceError> {
         let runtime_version = runtime_version(&validated.runtime_library_path)?;
         verify_runtime_version(&validated.manifest.onnx_runtime.version, &runtime_version)?;
-        ort::init_from(validated.runtime_library_path.to_string_lossy())
+        let threads = optimal_intra_threads(validated.manifest.onnx_runtime.intra_threads);
+        let init_builder = ort::init_from(validated.runtime_library_path.to_string_lossy())
             .with_name("cua-perception")
-            .with_telemetry(false)
+            .with_telemetry(false);
+        let pool = GlobalThreadPoolOptions::default()
+            .with_intra_threads(threads)
+            .and_then(|p| p.with_inter_threads(1))
+            .and_then(|p| p.with_spin_control(false))
+            .map_err(|error| InferenceError::Runtime(error.to_string()))?;
+        init_builder
+            .with_global_thread_pool(pool)
             .commit()
             .map_err(|error| InferenceError::Runtime(error.to_string()))?;
 
-        let threads = validated.manifest.onnx_runtime.intra_threads;
         let detector = load_session(&validated.detector_path, "detector", threads)?;
+        let ocr_detector = load_session(&validated.ocr_detector_path, "ocr_detector", threads)?;
+        let ocr_recognizer =
+            load_session(&validated.ocr_recognizer_path, "ocr_recognizer", threads)?;
+        let dictionary_source = fs::read_to_string(&validated.dictionary_path)
+            .map_err(|error| InferenceError::Dictionary(error.to_string()))?;
+        let dictionary =
+            parse_dictionary(&dictionary_source, validated.manifest.ocr.dictionary_format)?;
         verify_io(
             &detector,
             "detector",
@@ -87,7 +102,6 @@ impl OnnxBackend {
             ],
             3,
         )?;
-        let ocr_detector = load_session(&validated.ocr_detector_path, "ocr_detector", threads)?;
         verify_io(
             &ocr_detector,
             "ocr_detector",
@@ -96,12 +110,6 @@ impl OnnxBackend {
             &[1, 3, -1, -1],
             4,
         )?;
-        let ocr_recognizer =
-            load_session(&validated.ocr_recognizer_path, "ocr_recognizer", threads)?;
-        let dictionary_source = fs::read_to_string(&validated.dictionary_path)
-            .map_err(|error| InferenceError::Dictionary(error.to_string()))?;
-        let dictionary =
-            parse_dictionary(&dictionary_source, validated.manifest.ocr.dictionary_format)?;
         verify_recognizer_io(&ocr_recognizer, &validated, dictionary.len())?;
 
         Ok(Self {
@@ -134,63 +142,69 @@ impl OnnxBackend {
 
     pub fn parse(&self, image: &RgbImage) -> Result<Vec<InferenceRegion>, InferenceError> {
         let detector_manifest = &self.validated.manifest.detector;
-        let tensor = detector_tensor(
+        let ocr_detector_manifest = &self.validated.manifest.ocr.detector;
+
+        let det_tensor = detector_tensor(
             image,
             detector_manifest.input_width,
             detector_manifest.input_height,
         );
-        let detector_transform = tensor.letterbox;
-        let (shape, output) = run_tensor(
+        let ocr_tensor = ocr_detector_tensor(image, ocr_detector_manifest.input_width);
+
+        let detector_transform = det_tensor.letterbox;
+        let icons = run_tensor_with(
             &self.detector,
             "detector",
             &detector_manifest.input_name,
             &detector_manifest.output_name,
-            tensor,
-        )?;
-        let icons = decode_detector(
-            &output,
-            &shape,
-            detector_manifest.output_layout,
-            detector_transform,
-            DetectorPostprocess {
-                confidence_threshold: detector_manifest.confidence_threshold,
-                iou_threshold: detector_manifest.iou_threshold,
-                max_candidates: detector_manifest.max_candidates,
-                max_detections: detector_manifest.max_detections,
+            det_tensor,
+            |det_shape, det_output| {
+                decode_detector(
+                    det_output,
+                    det_shape,
+                    detector_manifest.output_layout,
+                    detector_transform,
+                    DetectorPostprocess {
+                        confidence_threshold: detector_manifest.confidence_threshold,
+                        iou_threshold: detector_manifest.iou_threshold,
+                        max_candidates: detector_manifest.max_candidates,
+                        max_detections: detector_manifest.max_detections,
+                    },
+                )
+                .map_err(|reason| InferenceError::Output {
+                    model: "detector",
+                    reason,
+                })
             },
-        )
-        .map_err(|reason| InferenceError::Output {
-            model: "detector",
-            reason,
-        })?;
+        )?;
 
-        let ocr_detector_manifest = &self.validated.manifest.ocr.detector;
-        let tensor = ocr_detector_tensor(image, ocr_detector_manifest.input_width);
-        let ocr_transform = tensor.letterbox;
-        let (shape, output) = run_tensor(
+        let ocr_transform = ocr_tensor.letterbox;
+        let text_boxes = run_tensor_with(
             &self.ocr_detector,
             "ocr_detector",
             &ocr_detector_manifest.input_name,
             &ocr_detector_manifest.output_name,
-            tensor,
-        )?;
-        let text_boxes = decode_ocr_probability_map(
-            &output,
-            &shape,
-            ocr_transform,
-            OcrPostprocess {
-                pixel_threshold: ocr_detector_manifest.pixel_threshold,
-                box_threshold: ocr_detector_manifest.box_threshold,
-                unclip_ratio: ocr_detector_manifest.unclip_ratio,
-                minimum_area: ocr_detector_manifest.minimum_area,
-                minimum_side: ocr_detector_manifest.minimum_side,
-                max_candidates: ocr_detector_manifest.max_candidates,
+            ocr_tensor,
+            |shape, output| {
+                decode_ocr_probability_map(
+                    output,
+                    shape,
+                    ocr_transform,
+                    OcrPostprocess {
+                        pixel_threshold: ocr_detector_manifest.pixel_threshold,
+                        box_threshold: ocr_detector_manifest.box_threshold,
+                        unclip_ratio: ocr_detector_manifest.unclip_ratio,
+                        minimum_area: ocr_detector_manifest.minimum_area,
+                        minimum_side: ocr_detector_manifest.minimum_side,
+                        max_candidates: ocr_detector_manifest.max_candidates,
+                    },
+                )
+                .map_err(|reason| InferenceError::Output {
+                    model: "ocr_detector",
+                    reason,
+                })
             },
-        )
-        .map_err(|reason| InferenceError::Output {
-            model: "ocr_detector",
-            reason,
-        })?;
+        )?;
 
         let mut regions = icons
             .into_iter()
@@ -202,11 +216,8 @@ impl OnnxBackend {
                 class_id: Some(detection.class_id),
             })
             .collect::<Vec<_>>();
-        for detection in text_boxes {
-            if let Some(region) = self.recognize(image, detection)? {
-                regions.push(region);
-            }
-        }
+        let text_regions = self.recognize_batch(image, text_boxes)?;
+        regions.extend(text_regions);
         regions.sort_by(|left, right| {
             left.bounds
                 .y1
@@ -228,49 +239,104 @@ impl OnnxBackend {
         }))
     }
 
-    fn recognize(
+    fn recognize_batch(
         &self,
         image: &RgbImage,
-        detection: Detection,
-    ) -> Result<Option<InferenceRegion>, InferenceError> {
+        detections: Vec<Detection>,
+    ) -> Result<Vec<InferenceRegion>, InferenceError> {
         let (image_width, image_height) = image.dimensions();
-        let x1 = detection.bounds.x1.floor().max(0.0) as u32;
-        let y1 = detection.bounds.y1.floor().max(0.0) as u32;
-        let x2 = detection.bounds.x2.ceil().min(image_width as f32) as u32;
-        let y2 = detection.bounds.y2.ceil().min(image_height as f32) as u32;
-        if x2 <= x1 || y2 <= y1 {
-            return Ok(None);
-        }
-        let crop = image::imageops::crop_imm(image, x1, y1, x2 - x1, y2 - y1).to_image();
         let manifest = &self.validated.manifest.ocr.recognizer;
-        let tensor = ocr_recognizer_tensor(&crop, manifest.input_width, manifest.input_height);
-        let (shape, output) = run_tensor(
+        let input_width = manifest.input_width;
+        let input_height = manifest.input_height;
+
+        let valid_detections: Vec<(Detection, u32, u32, u32, u32)> = detections
+            .into_iter()
+            .filter_map(|detection| {
+                let x1 = detection.bounds.x1.floor().max(0.0) as u32;
+                let y1 = detection.bounds.y1.floor().max(0.0) as u32;
+                let x2 = detection.bounds.x2.ceil().min(image_width as f32) as u32;
+                let y2 = detection.bounds.y2.ceil().min(image_height as f32) as u32;
+                if x2 > x1 && y2 > y1 {
+                    Some((detection, x1, y1, x2, y2))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if valid_detections.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = valid_detections.len();
+        let single_elems = 3 * (input_height as usize) * (input_width as usize);
+        let mut batched_data = Vec::with_capacity(batch_size * single_elems);
+        for (_, x1, y1, x2, y2) in &valid_detections {
+            let crop = image::imageops::crop_imm(image, *x1, *y1, *x2 - *x1, *y2 - *y1).to_image();
+            let tensor = ocr_recognizer_tensor(&crop, input_width, input_height);
+            batched_data.extend_from_slice(&tensor.data);
+        }
+        let batched_tensor = ImageTensor {
+            shape: [
+                batch_size,
+                3,
+                input_height as usize,
+                input_width as usize,
+            ],
+            data: batched_data,
+            letterbox: crate::preprocess::Letterbox {
+                original_width: input_width,
+                original_height: input_height,
+                input_width,
+                input_height,
+                resized_width: input_width,
+                resized_height: input_height,
+                pad_x: 0,
+                pad_y: 0,
+                scale_x: 1.0,
+                scale_y: 1.0,
+            },
+        };
+        run_tensor_with(
             &self.ocr_recognizer,
             "ocr_recognizer",
             &manifest.input_name,
             &manifest.output_name,
-            tensor,
-        )?;
-        let (text, recognition_confidence) =
-            ctc_decode(&output, &shape, &self.dictionary, manifest.blank_index).map_err(
-                |reason| InferenceError::Output {
-                    model: "ocr_recognizer",
-                    reason,
-                },
-            )?;
-        // The recognizer dictionary includes a space class, so a crop can
-        // decode to whitespace only. Driver rejects whitespace-only text, and
-        // one such region would invalidate the whole parse.
-        let Some(text) = recognized_text(text) else {
-            return Ok(None);
-        };
-        Ok(Some(InferenceRegion {
-            kind: "text",
-            bounds: detection.bounds,
-            text: Some(text),
-            confidence: (detection.score * recognition_confidence).clamp(0.0, 1.0),
-            class_id: None,
-        }))
+            batched_tensor,
+            |shape, output| {
+                if shape.len() != 3 || shape[0] as usize != batch_size {
+                    return Err(InferenceError::Output {
+                        model: "ocr_recognizer",
+                        reason: format!("unexpected batch output shape {shape:?}"),
+                    });
+                }
+                let item_stride = (shape[1] * shape[2]) as usize;
+                let single_shape = [1_i64, shape[1], shape[2]];
+                let mut regions = Vec::with_capacity(batch_size);
+                for (i, (detection, _, _, _, _)) in valid_detections.into_iter().enumerate() {
+                    let slice = &output[i * item_stride..(i + 1) * item_stride];
+                    let (text, recognition_confidence) = ctc_decode(
+                        slice,
+                        &single_shape,
+                        &self.dictionary,
+                        manifest.blank_index,
+                    )
+                    .map_err(|reason| InferenceError::Output {
+                        model: "ocr_recognizer",
+                        reason,
+                    })?;
+                    if let Some(text) = recognized_text(text) {
+                        regions.push(InferenceRegion {
+                            kind: "text",
+                            bounds: detection.bounds,
+                            text: Some(text),
+                            confidence: (detection.score * recognition_confidence).clamp(0.0, 1.0),
+                            class_id: None,
+                        });
+                    }
+                }
+                Ok(regions)
+            },
+        )
     }
 }
 
@@ -330,16 +396,66 @@ fn parse_dictionary(source: &str, format: DictionaryFormat) -> Result<Vec<String
     Ok(values)
 }
 
+fn optimal_intra_threads(manifest_threads: usize) -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn sysctlbyname(
+                name: *const c_char,
+                oldp: *mut c_void,
+                oldlenp: *mut usize,
+                newp: *const c_void,
+                newlen: usize,
+            ) -> i32;
+        }
+        let mut perf_cores: i32 = 0;
+        let mut size = std::mem::size_of::<i32>();
+        let rc = unsafe {
+            sysctlbyname(
+                b"hw.perflevel0.logicalcpu\0".as_ptr().cast(),
+                std::ptr::addr_of_mut!(perf_cores).cast(),
+                &mut size,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if rc == 0 && perf_cores > 0 {
+            return (perf_cores as usize).clamp(manifest_threads, 16);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(manifest_threads, 6))
+        .unwrap_or(manifest_threads)
+}
+
 fn load_session(
     path: &Path,
     model: &'static str,
     intra_threads: usize,
 ) -> Result<Session, InferenceError> {
+    let opt_path = path.with_extension("opt.onnx");
+    let use_pre_optimized = opt_path.is_file();
+    let save_optimized =
+        !use_pre_optimized && std::env::var("CUA_SAVE_OPT_MODELS").as_deref() == Ok("1");
+    let target_path = if use_pre_optimized { &opt_path } else { path };
+    let opt_level = if use_pre_optimized {
+        GraphOptimizationLevel::Disable
+    } else {
+        GraphOptimizationLevel::Level3
+    };
+
     Session::builder()
-        .and_then(|builder| builder.with_optimization_level(GraphOptimizationLevel::Level3))
+        .and_then(|builder| builder.with_optimization_level(opt_level))
+        .and_then(|builder| {
+            if save_optimized {
+                builder.with_optimized_model_path(&opt_path)
+            } else {
+                Ok(builder)
+            }
+        })
         .and_then(|builder| builder.with_intra_threads(intra_threads))
-        .and_then(|builder| builder.with_memory_pattern(false))
-        .and_then(|builder| builder.commit_from_file(path))
+        .and_then(|builder| builder.with_memory_pattern(true))
+        .and_then(|builder| builder.commit_from_file(target_path))
         .map_err(|error| InferenceError::Run {
             model,
             reason: error.to_string(),
@@ -503,13 +619,17 @@ fn verify_shape(
     Ok(())
 }
 
-fn run_tensor(
+fn run_tensor_with<T, F>(
     session: &Mutex<Session>,
     model: &'static str,
     input_name: &str,
     output_name: &str,
     tensor: ImageTensor,
-) -> Result<(Vec<i64>, Vec<f32>), InferenceError> {
+    f: F,
+) -> Result<T, InferenceError>
+where
+    F: FnOnce(&[i64], &[f32]) -> Result<T, InferenceError>,
+{
     let input =
         Tensor::from_array((tensor.shape, tensor.data.into_boxed_slice())).map_err(|error| {
             InferenceError::Run {
@@ -540,7 +660,7 @@ fn run_tensor(
                 model,
                 reason: error.to_string(),
             })?;
-    Ok((shape.to_vec(), data.to_vec()))
+    f(shape, data)
 }
 
 #[cfg(test)]
