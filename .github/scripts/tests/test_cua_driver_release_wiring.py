@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import textwrap
+import tomllib
 import unittest
 
 
@@ -259,8 +260,8 @@ fi
         self.assertNotIn("NSMicrophoneUsageDescription", plist)
 
         cli = self.read("libs/cua-driver/rust/crates/cua-driver/src/cli.rs")
-        self.assertIn("missing from Screen & System Audio Recording", cli)
-        self.assertIn("add {app_path}", cli)
+        self.assertIn("isn't in the Screen & System Audio Recording list", cli)
+        self.assertIn("choose {app_path}", cli)
 
         limits = self.read("docs/content/docs/cua-driver/guides/troubleshoot.mdx")
         self.assertIn("without this grant it returns the tree only (no PNG)", limits)
@@ -442,6 +443,16 @@ fi
                 workflow,
                 relative_path,
             )
+
+    def test_linux_unit_triggers_on_every_member_its_workspace_clippy_lints(self) -> None:
+        manifest = tomllib.loads(self.read("libs/cua-driver/rust/Cargo.toml"))
+        workflow = self.read(".github/workflows/ci-rust-linux.yml")
+        triggers = workflow.split("\n  workflow_dispatch:", 1)[0]
+        _, pull_request, push = re.split(r"\n  (?:pull_request|push):\n", triggers)
+        for member in manifest["workspace"]["members"]:
+            entry = f'      - "libs/cua-driver/rust/{member}/**"\n'
+            self.assertIn(entry, pull_request, member)
+            self.assertIn(entry, push, member)
 
     def test_release_please_keeps_release_version_sources_synced(self) -> None:
         config = self.read("release-please-config.json")
