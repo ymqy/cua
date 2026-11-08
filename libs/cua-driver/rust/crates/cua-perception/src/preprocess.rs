@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-use image::{imageops::FilterType, Rgb, RgbImage};
+use image::{imageops::FilterType, RgbImage};
+#[cfg(test)]
+use image::Rgb;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Letterbox {
@@ -25,10 +27,64 @@ pub struct ImageTensor {
 }
 
 pub fn detector_tensor(image: &RgbImage, width: u32, height: u32) -> ImageTensor {
-    let (canvas, letterbox) = letterbox(image, width, height, Rgb([114, 114, 114]));
+    let (original_width, original_height) = image.dimensions();
+    let scale = (width as f32 / original_width as f32).min(height as f32 / original_height as f32);
+    let resized_width = ((original_width as f32 * scale).round() as u32).clamp(1, width);
+    let resized_height = ((original_height as f32 * scale).round() as u32).clamp(1, height);
+    let pad_x = (width - resized_width) / 2;
+    let pad_y = (height - resized_height) / 2;
+    let resized =
+        image::imageops::resize(image, resized_width, resized_height, FilterType::Triangle);
+
+    let w_usize = width as usize;
+    let h_usize = height as usize;
+    let plane = w_usize * h_usize;
+    let fill_val = 114.0_f32 / 255.0;
+    let mut data = vec![fill_val; plane * 3];
+    let (r_plane, rest) = data.split_at_mut(plane);
+    let (g_plane, b_plane) = rest.split_at_mut(plane);
+
+    let rw_usize = resized_width as usize;
+    let rh_usize = resized_height as usize;
+    let px_usize = pad_x as usize;
+    let py_usize = pad_y as usize;
+    let raw = resized.as_raw();
+    const SCALE: f32 = 1.0 / 255.0;
+
+    for y in 0..rh_usize {
+        let dst_row_start = (py_usize + y) * w_usize + px_usize;
+        let src_row_start = y * rw_usize * 3;
+        let src_row = &raw[src_row_start..src_row_start + rw_usize * 3];
+        let r_row = &mut r_plane[dst_row_start..dst_row_start + rw_usize];
+        let g_row = &mut g_plane[dst_row_start..dst_row_start + rw_usize];
+        let b_row = &mut b_plane[dst_row_start..dst_row_start + rw_usize];
+        for (((rgb, r_out), g_out), b_out) in src_row
+            .chunks_exact(3)
+            .zip(r_row.iter_mut())
+            .zip(g_row.iter_mut())
+            .zip(b_row.iter_mut())
+        {
+            *r_out = f32::from(rgb[0]) * SCALE;
+            *g_out = f32::from(rgb[1]) * SCALE;
+            *b_out = f32::from(rgb[2]) * SCALE;
+        }
+    }
+
+    let letterbox = Letterbox {
+        original_width,
+        original_height,
+        input_width: width,
+        input_height: height,
+        resized_width,
+        resized_height,
+        pad_x,
+        pad_y,
+        scale_x: resized_width as f32 / original_width as f32,
+        scale_y: resized_height as f32 / original_height as f32,
+    };
     ImageTensor {
-        shape: [1, 3, height as usize, width as usize],
-        data: rgb_chw(&canvas, [0.0; 3], [1.0; 3], 1.0 / 255.0),
+        shape: [1, 3, h_usize, w_usize],
+        data,
         letterbox,
     }
 }
@@ -66,10 +122,40 @@ pub fn ocr_recognizer_tensor(image: &RgbImage, width: u32, height: u32) -> Image
     let scale = (height as f32 / image.height() as f32).min(width as f32 / image.width() as f32);
     let resized_width = ((image.width() as f32 * scale).round() as u32).clamp(1, width);
     let resized = image::imageops::resize(image, resized_width, height, FilterType::Triangle);
-    // PP-OCR normalization maps 127.5 to zero. Mid-gray padding therefore
-    // represents neutral input rather than solid black content.
-    let mut canvas = RgbImage::from_pixel(width, height, Rgb([128, 128, 128]));
-    image::imageops::replace(&mut canvas, &resized, 0, 0);
+
+    let w_usize = width as usize;
+    let h_usize = height as usize;
+    let plane = w_usize * h_usize;
+    // PP-OCR normalization maps 127.5 to zero. Mid-gray padding (128)
+    // therefore represents neutral input rather than solid black content.
+    let pad_val = (128.0_f32 / 255.0 - 0.5) / 0.5;
+    let mut data = vec![pad_val; plane * 3];
+    let (b_plane, rest) = data.split_at_mut(plane);
+    let (g_plane, r_plane) = rest.split_at_mut(plane);
+
+    let rw_usize = resized_width as usize;
+    let raw = resized.as_raw();
+    const SCALE: f32 = 1.0 / 255.0;
+
+    for y in 0..h_usize {
+        let dst_row_start = y * w_usize;
+        let src_row_start = y * rw_usize * 3;
+        let src_row = &raw[src_row_start..src_row_start + rw_usize * 3];
+        let b_row = &mut b_plane[dst_row_start..dst_row_start + rw_usize];
+        let g_row = &mut g_plane[dst_row_start..dst_row_start + rw_usize];
+        let r_row = &mut r_plane[dst_row_start..dst_row_start + rw_usize];
+        for (((rgb, b_out), g_out), r_out) in src_row
+            .chunks_exact(3)
+            .zip(b_row.iter_mut())
+            .zip(g_row.iter_mut())
+            .zip(r_row.iter_mut())
+        {
+            *b_out = (f32::from(rgb[2]) * SCALE - 0.5) / 0.5;
+            *g_out = (f32::from(rgb[1]) * SCALE - 0.5) / 0.5;
+            *r_out = (f32::from(rgb[0]) * SCALE - 0.5) / 0.5;
+        }
+    }
+
     let letterbox = Letterbox {
         original_width: image.width(),
         original_height: image.height(),
@@ -83,52 +169,14 @@ pub fn ocr_recognizer_tensor(image: &RgbImage, width: u32, height: u32) -> Image
         scale_y: height as f32 / image.height() as f32,
     };
     ImageTensor {
-        shape: [1, 3, height as usize, width as usize],
-        data: bgr_chw(&canvas, [0.5; 3], [0.5; 3], 1.0 / 255.0),
+        shape: [1, 3, h_usize, w_usize],
+        data,
         letterbox,
     }
 }
 
-fn letterbox(
-    image: &RgbImage,
-    input_width: u32,
-    input_height: u32,
-    fill: Rgb<u8>,
-) -> (RgbImage, Letterbox) {
-    let (original_width, original_height) = image.dimensions();
-    let scale = (input_width as f32 / original_width as f32)
-        .min(input_height as f32 / original_height as f32);
-    let resized_width = ((original_width as f32 * scale).round() as u32).clamp(1, input_width);
-    let resized_height = ((original_height as f32 * scale).round() as u32).clamp(1, input_height);
-    let pad_x = (input_width - resized_width) / 2;
-    let pad_y = (input_height - resized_height) / 2;
-    let resized =
-        image::imageops::resize(image, resized_width, resized_height, FilterType::Triangle);
-    let mut canvas = RgbImage::from_pixel(input_width, input_height, fill);
-    image::imageops::replace(&mut canvas, &resized, i64::from(pad_x), i64::from(pad_y));
-    (
-        canvas,
-        Letterbox {
-            original_width,
-            original_height,
-            input_width,
-            input_height,
-            resized_width,
-            resized_height,
-            pad_x,
-            pad_y,
-            scale_x: resized_width as f32 / original_width as f32,
-            scale_y: resized_height as f32 / original_height as f32,
-        },
-    )
-}
-
 fn round_to_multiple(value: u32, multiple: u32) -> u32 {
     ((value.max(multiple) + multiple / 2) / multiple * multiple).max(multiple)
-}
-
-fn rgb_chw(image: &RgbImage, mean: [f32; 3], std: [f32; 3], scale: f32) -> Vec<f32> {
-    channels_chw(image, mean, std, scale, [0, 1, 2])
 }
 
 fn bgr_chw(image: &RgbImage, mean: [f32; 3], std: [f32; 3], scale: f32) -> Vec<f32> {
@@ -144,11 +192,19 @@ fn channels_chw(
 ) -> Vec<f32> {
     let plane = image.width() as usize * image.height() as usize;
     let mut data = vec![0.0; plane * 3];
-    for (index, pixel) in image.pixels().enumerate() {
-        for channel in 0..3 {
-            data[channel * plane + index] =
-                (f32::from(pixel[order[channel]]) * scale - mean[channel]) / std[channel];
-        }
+    let (p0, rest) = data.split_at_mut(plane);
+    let (p1, p2) = rest.split_at_mut(plane);
+    let raw = image.as_raw();
+    let [o0, o1, o2] = order;
+    for (((rgb, out0), out1), out2) in raw
+        .chunks_exact(3)
+        .zip(p0.iter_mut())
+        .zip(p1.iter_mut())
+        .zip(p2.iter_mut())
+    {
+        *out0 = (f32::from(rgb[o0]) * scale - mean[0]) / std[0];
+        *out1 = (f32::from(rgb[o1]) * scale - mean[1]) / std[1];
+        *out2 = (f32::from(rgb[o2]) * scale - mean[2]) / std[2];
     }
     data
 }

@@ -102,6 +102,35 @@ fn decode_yolo_v8(
         }
     };
     let mut detections = Vec::new();
+    if feature_major && features == 5 {
+        let scores = &data[4 * boxes..5 * boxes];
+        for (box_index, &score) in scores.iter().enumerate() {
+            if !score.is_finite() || score < threshold {
+                continue;
+            }
+            let cx = data[box_index];
+            let cy = data[boxes + box_index];
+            let width = data[2 * boxes + box_index];
+            let height = data[3 * boxes + box_index];
+            let bounds = restore(
+                Rect {
+                    x1: cx - width * 0.5,
+                    y1: cy - height * 0.5,
+                    x2: cx + width * 0.5,
+                    y2: cy + height * 0.5,
+                },
+                transform,
+            );
+            if valid(bounds) {
+                detections.push(Detection {
+                    bounds,
+                    score,
+                    class_id: 0,
+                });
+            }
+        }
+        return Ok(detections);
+    }
     for box_index in 0..boxes {
         let (class_id, score) = (4..features)
             .map(|feature| (feature - 4, at(box_index, feature)))
@@ -182,12 +211,14 @@ pub fn decode_ocr_probability_map(
     }
     let mut visited = vec![false; data.len()];
     let mut regions = Vec::new();
+    let mut queue = VecDeque::with_capacity(256);
     for start in 0..data.len() {
         if visited[start] || !data[start].is_finite() || data[start] < config.pixel_threshold {
             continue;
         }
         visited[start] = true;
-        let mut queue = VecDeque::from([start]);
+        queue.clear();
+        queue.push_back(start);
         let mut min_x = width;
         let mut min_y = height;
         let mut max_x = 0;
@@ -306,6 +337,10 @@ pub fn ctc_decode(
     let mut confidence = 0.0;
     let mut emitted = 0_u32;
     for logits in data.chunks_exact(classes) {
+        if logits[blank_index] > 0.5 {
+            previous = blank_index;
+            continue;
+        }
         let (index, score) = logits
             .iter()
             .copied()

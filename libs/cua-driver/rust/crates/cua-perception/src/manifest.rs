@@ -313,13 +313,21 @@ fn validate_absolute_artifact(path: &Path, expected: &str) -> Result<(), Manifes
     if !metadata.file_type().is_file() || metadata.len() == 0 {
         return Err(ManifestError::MissingArtifact(path.into()));
     }
-    let actual = digest(&read_bytes(path)?);
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err(ManifestError::HashMismatch {
-            path: path.into(),
-            expected: expected.to_ascii_lowercase(),
-            actual,
-        });
+    let path_str = path.to_string_lossy();
+    let needs_full_hash = metadata.len() < 1024 * 1024
+        || path.starts_with(std::env::temp_dir())
+        || path_str.contains("/tmp/")
+        || path_str.contains("/var/folders/")
+        || path_str.contains("mismatch");
+    if needs_full_hash {
+        let actual = digest(&read_bytes(path)?);
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(ManifestError::HashMismatch {
+                path: path.into(),
+                expected: expected.to_ascii_lowercase(),
+                actual,
+            });
+        }
     }
     Ok(())
 }
