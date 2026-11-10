@@ -130,7 +130,7 @@ impl Tool for SetValueTool {
         //    typed like a user would: click the field (real pointer), select
         //    all, type, commit with Tab.
         let is_combo = token.observed.role.eq_ignore_ascii_case("combo box");
-        let wayland = crate::wayland::wayland_input_enabled();
+        let wayland = crate::wayland::is_wayland();
         let wayland_route = wayland;
         let background_route = !delivery.is_foreground()
             && !wayland
@@ -213,7 +213,7 @@ impl Tool for SetValueTool {
                     crate::interaction::with_x11_foreground(
                         win,
                         crate::input::ForegroundOptions::pointer(),
-                        crate::interaction::RestoreMode::LeaveFocused,
+                        crate::interaction::session_policy().menu,
                         || {
                             crate::input::send_click_xtest_desktop(
                                 sx.round() as i32,
@@ -331,7 +331,7 @@ fn pick_from_popup(
             crate::interaction::with_x11_foreground(
                 win,
                 crate::input::ForegroundOptions::keyboard(),
-                crate::interaction::RestoreMode::LeaveFocused,
+                crate::interaction::session_policy().menu,
                 || crate::input::send_key_xtest("Escape", &[]),
             )
             .map(|_| ())
@@ -365,7 +365,7 @@ fn pick_from_popup(
         crate::interaction::with_x11_foreground(
             win,
             crate::input::ForegroundOptions::pointer(),
-            crate::interaction::RestoreMode::LeaveFocused,
+            crate::interaction::session_policy().menu,
             || crate::input::send_click_xtest_desktop(sx.round() as i32, sy.round() as i32, 1, 1),
         )?;
         open_and_pick()?;

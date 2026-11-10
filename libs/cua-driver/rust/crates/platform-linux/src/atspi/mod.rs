@@ -470,7 +470,9 @@ pub fn perform_action_at_point_in(
                 if skip_focus_roles && is_focus_taking_role(&element.role) {
                     return Ok(None);
                 }
-                if native::is_container_role(&element.role) {
+                if native::is_container_role(&element.role)
+                    || native::is_web_document_role(&element.role)
+                {
                     // The cached snapshot's smallest covering element is a
                     // container (list / icon view / pane): its activation
                     // opens the current selection, not the item under the
@@ -1161,7 +1163,25 @@ mod bridge_disabled_reason_tests {
                 .stderr(Stdio::null())
                 .spawn()
                 .expect("spawn sleep");
-            Self(child)
+            // Built before polling so a timed-out wait still kills and reaps the child.
+            let sleeper = Self(child);
+            // `spawn` can return before the kernel has finished the child's exec,
+            // and until then its environ doesn't hold what it was given.
+            let expected = format!("NO_AT_BRIDGE={value}").into_bytes();
+            let environ = format!("/proc/{}/environ", sleeper.0.id());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !std::fs::read(&environ)
+                .unwrap_or_default()
+                .split(|&byte| byte == 0)
+                .any(|entry| entry == expected.as_slice())
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "sleep never finished exec"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            sleeper
         }
     }
 
