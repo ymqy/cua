@@ -33,7 +33,7 @@ jobs:
 
     steps:
       - name: Checkout fork repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: feat/wayland-with-perception-opt
           fetch-depth: 0
@@ -54,27 +54,20 @@ jobs:
             git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           fi
 
+          # 1. 通过 GitHub 官方服务端 Sync Fork 接口顺带同步 main 分支（不走受 workflow 限制的 git push）
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main >/dev/null 2>&1 || true
+
           git fetch upstream main
-          git fetch origin main "${TARGET_BRANCH}"
+          git fetch origin "${TARGET_BRANCH}"
 
           UPSTREAM_SHA=$(git rev-parse upstream/main)
           UPSTREAM_SHORT=$(git rev-parse --short upstream/main)
           echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
           echo "upstream_short=${UPSTREAM_SHORT}" >> "$GITHUB_OUTPUT"
 
-          # 1. 保持 fork 的 main 分支与官方 upstream/main 同步
-          git checkout -B main origin/main
-          if ! git merge-base --is-ancestor upstream/main main; then
-            git merge --ff-only upstream/main
-            git push origin main
-            echo "Updated origin/main -> ${UPSTREAM_SHORT}"
-          else
-            echo "origin/main is already at ${UPSTREAM_SHORT}"
-          fi
-
           # 2. 检查目标分支是否已包含最新 upstream/main
           git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
-          if git merge-base --is-ancestor main HEAD; then
+          if git merge-base --is-ancestor upstream/main HEAD; then
             echo "status=up_to_date" >> "$GITHUB_OUTPUT"
             echo "${TARGET_BRANCH} already contains ${UPSTREAM_SHORT}. Nothing to do."
             exit 0
@@ -93,8 +86,8 @@ jobs:
             exit 0
           fi
 
-          # 4. 尝试合并（先不自动提交，以便自动清理上游自带的 workflows）
-          git merge --no-commit --no-ff main || true
+          # 4. 尝试将 upstream/main 合并进目标分支（先不提交，自动剥离上游自带的 workflows）
+          git merge --no-commit --no-ff upstream/main || true
 
           # 自动移除因上游修改/新增 .github/workflows/*.yml 产生的文件或删改冲突，始终只保留 sync-upstream.yml
           while IFS= read -r wf; do
