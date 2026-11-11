@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.47.12](https://github.com/trycua/cua/compare/cua-driver-rs-v0.47.11...cua-driver-rs-v0.47.12) (2026-11-11)
+
+
+### Bug Fixes
+
+* **cua-driver:** keep trusting GNOME Shell and KWin after an update replaces their binary ([#5370](https://github.com/trycua/cua/issues/5370)) ([f9a2768](https://github.com/trycua/cua/commit/f9a2768c3d7eda97dc9a6e462415759e84d8a61e))
+
+## [0.47.11](https://github.com/trycua/cua/compare/cua-driver-rs-v0.47.10...cua-driver-rs-v0.47.11) (2026-11-11)
+
+
+### Bug Fixes
+
+* **cua-driver:** stamp the window-local point on macOS 27 background drags ([#7372](https://github.com/trycua/cua/issues/7372)) ([a00a44b](https://github.com/trycua/cua/commit/a00a44bb04a7777cd0c65cf0f722e23b1b1790ad))
+
 ## [0.47.10](https://github.com/trycua/cua/compare/cua-driver-rs-v0.47.9...cua-driver-rs-v0.47.10) (2026-11-11)
 
 
