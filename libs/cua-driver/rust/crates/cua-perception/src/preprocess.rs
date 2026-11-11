@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Cua AI, Inc.
 
-use image::{imageops::FilterType, RgbImage};
 #[cfg(test)]
 use image::Rgb;
+use image::{imageops::FilterType, RgbImage};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Letterbox {

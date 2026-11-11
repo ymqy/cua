@@ -3648,7 +3648,10 @@ fn action_button_matches(visited: &[Visited<'_>], target_label: &str) -> Vec<usi
             let is_button = role_lower.contains("button")
                 || node.actions.iter().any(|a| {
                     let verb = normalized_action_verb(a);
-                    matches!(verb.as_str(), "press" | "click" | "open" | "dodefault" | "activate")
+                    matches!(
+                        verb.as_str(),
+                        "press" | "click" | "open" | "dodefault" | "activate"
+                    )
                 });
             if !is_button {
                 return None;
@@ -3680,15 +3683,20 @@ fn action_button_matches(visited: &[Visited<'_>], target_label: &str) -> Vec<usi
             let is_button = role_lower.contains("button")
                 || node.actions.iter().any(|a| {
                     let verb = normalized_action_verb(a);
-                    matches!(verb.as_str(), "press" | "click" | "open" | "dodefault" | "activate")
+                    matches!(
+                        verb.as_str(),
+                        "press" | "click" | "open" | "dodefault" | "activate"
+                    )
                 });
             if !is_button {
                 return None;
             }
             let name_lower = node.name.trim().to_ascii_lowercase();
             let desc_lower = node.description.trim().to_ascii_lowercase();
-            if (!name_lower.is_empty() && (name_lower.contains(&target_lower) || target_lower.contains(&name_lower)))
-                || (!desc_lower.is_empty() && (desc_lower.contains(&target_lower) || target_lower.contains(&desc_lower)))
+            if (!name_lower.is_empty()
+                && (name_lower.contains(&target_lower) || target_lower.contains(&name_lower)))
+                || (!desc_lower.is_empty()
+                    && (desc_lower.contains(&target_lower) || target_lower.contains(&desc_lower)))
             {
                 Some(index)
             } else {
@@ -3701,7 +3709,10 @@ fn action_button_matches(visited: &[Visited<'_>], target_label: &str) -> Vec<usi
     }
 
     // 3. Common application menu buttons (hamburger menu / app menu) if label is generic like "Menu", "App", "File", "Options"
-    if matches!(target_lower.as_str(), "menu" | "app" | "main menu" | "options" | "more") {
+    if matches!(
+        target_lower.as_str(),
+        "menu" | "app" | "main menu" | "options" | "more"
+    ) {
         let app_menus: Vec<usize> = visited
             .iter()
             .enumerate()
@@ -3790,7 +3801,9 @@ pub fn invoke_menu_path_in(pid: u32, xid: u64, path: &[String]) -> Result<()> {
                 }
                 let chosen = activation_index(&target.role, &target.actions)
                     .or_else(|| {
-                        if target.role.to_ascii_lowercase().contains("button") && !target.actions.is_empty() {
+                        if target.role.to_ascii_lowercase().contains("button")
+                            && !target.actions.is_empty()
+                        {
                             Some(0)
                         } else {
                             None

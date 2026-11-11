@@ -39,7 +39,8 @@ impl LinuxSecretServiceKeyProvider {
     }
 
     fn read_file_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, HistoryError> {
-        let bytes = fs::read(path).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        let bytes =
+            fs::read(path).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
         if bytes.len() != 32 {
             return Err(HistoryError::new(HistoryHealthCategory::KeyCorrupt));
         }
@@ -48,7 +49,8 @@ impl LinuxSecretServiceKeyProvider {
 
     fn write_file_key(path: &Path, bytes: &[u8]) -> Result<(), HistoryError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+            fs::create_dir_all(parent)
+                .map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -64,10 +66,15 @@ impl LinuxSecretServiceKeyProvider {
             options.mode(0o600);
         }
         use std::io::Write;
-        let mut file = options.open(&temp_path).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
-        file.write_all(bytes).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
-        file.sync_data().map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
-        fs::rename(temp_path, path).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        file.write_all(bytes)
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        file.sync_data()
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+        fs::rename(temp_path, path)
+            .map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
         Ok(())
     }
 }
@@ -87,7 +94,8 @@ impl KeyProvider for LinuxSecretServiceKeyProvider {
                     });
                 }
                 let mut bytes = Zeroizing::new(vec![0_u8; 32]);
-                getrandom::fill(&mut bytes).map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
+                getrandom::fill(&mut bytes)
+                    .map_err(|_| HistoryError::new(HistoryHealthCategory::KeyUnavailable))?;
                 Self::write_file_key(&path, &bytes)?;
                 Ok(HistoryKey {
                     reference: format!("file:{}", path.display()),

@@ -117,9 +117,12 @@ impl Tool for SetWindowFrameTool {
 
         if crate::wayland::is_wayland() {
             if let Some(port) = detect_cdp_port(Some(input.pid)) {
-                match cua_driver_core::cdp::set_window_bounds_via_cdp(port, x, y, width, height).await {
+                match cua_driver_core::cdp::set_window_bounds_via_cdp(port, x, y, width, height)
+                    .await
+                {
                     Ok((actual_x, actual_y, actual_w, actual_h)) => {
-                        let confirmed = (actual_x, actual_y, actual_w, actual_h) == (x, y, width, height);
+                        let confirmed =
+                            (actual_x, actual_y, actual_w, actual_h) == (x, y, width, height);
                         let requested = (x, y, width, height);
                         let observed = Some((actual_x, actual_y, actual_w, actual_h));
                         let effect = effect_from_value_readback(confirmed, true, true);
@@ -129,7 +132,9 @@ impl Tool for SetWindowFrameTool {
                             RequestedDelivery::NotApplicable,
                         )
                         .actual_delivery(ActualDelivery::NotApplicable)
-                        .detail(format!("requested={requested:?} observed={observed:?} via cdp:{port}"));
+                        .detail(format!(
+                            "requested={requested:?} observed={observed:?} via cdp:{port}"
+                        ));
                         record = record.evidence(ActionEvidence {
                             kind: EvidenceKind::ValueReadback,
                             detail: if confirmed {
@@ -143,7 +148,9 @@ impl Tool for SetWindowFrameTool {
                         } else {
                             "The window frame did not settle at the requested geometry via CDP."
                         })
-                        .with_action_record(record.build().expect("set_window_frame record is valid"));
+                        .with_action_record(
+                            record.build().expect("set_window_frame record is valid"),
+                        );
                     }
                     Err(error) => {
                         tracing::warn!("CDP set_window_bounds failed: {error}");

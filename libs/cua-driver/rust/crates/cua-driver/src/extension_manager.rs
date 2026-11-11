@@ -695,7 +695,9 @@ fn install_extension_from_mcp(confirmed: bool) -> Result<(String, serde_json::Va
             ];
             candidates.into_iter().find(|p| p.is_file())
         })
-        .ok_or_else(|| anyhow!("CUA_DRIVER_PERCEPTION_CATALOG must name the reviewed catalog at daemon launch"))?;
+        .ok_or_else(|| {
+            anyhow!("CUA_DRIVER_PERCEPTION_CATALOG must name the reviewed catalog at daemon launch")
+        })?;
     let entry = registry_entry("perception")?;
     let store = ExtensionStore::new(extension_root()?);
     let parsed = ParsedCommand {
@@ -2446,7 +2448,9 @@ impl ExtensionStore {
                 )
                 .context("signed catalog changed or became stale before mutation")?;
                 if source.trust_update.as_ref() != Some(&verified) {
-                    bail!("signed catalog trust decision changed before mutation; inspect it again");
+                    bail!(
+                        "signed catalog trust decision changed before mutation; inspect it again"
+                    );
                 }
                 // Derive the ledger now, under the lock and from the same state as
                 // the trust decision, but persist it only once the artifact is
@@ -2836,7 +2840,9 @@ impl ExtensionStore {
         };
         let pointer = match if self_test {
             self.recover_activation_locked(&lock.root, entry.id)
-                .and_then(|()| self.recover_publisher_trust_from_active_locked(&lock.root, entry.id))
+                .and_then(|()| {
+                    self.recover_publisher_trust_from_active_locked(&lock.root, entry.id)
+                })
                 .and_then(|()| self.active_pointer_locked(&lock.root, entry.id))
         } else {
             match self.active_pointer_locked(&lock.root, entry.id) {
@@ -2845,8 +2851,7 @@ impl ExtensionStore {
                     .recover_activation_locked(&lock.root, entry.id)
                     .and_then(|()| self.active_pointer_locked(&lock.root, entry.id)),
             }
-        }
-        {
+        } {
             Ok(pointer) => pointer,
             Err(error) => {
                 return Ok(ExtensionInfo {

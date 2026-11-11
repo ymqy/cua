@@ -120,7 +120,8 @@ async fn parallel_drag_wayland(args: &Value) -> ToolResult {
             .and_then(|v| v.as_u64())
             .or(default_window_id);
 
-        let local: Vec<(f64, f64)> = if let Some(pts) = item.get("path").and_then(|v| v.as_array()) {
+        let local: Vec<(f64, f64)> = if let Some(pts) = item.get("path").and_then(|v| v.as_array())
+        {
             let mut out = Vec::with_capacity(pts.len());
             for p in pts {
                 let a = p.as_array();
@@ -176,7 +177,8 @@ async fn parallel_drag_wayland(args: &Value) -> ToolResult {
             .and_then(|v| v.as_u64())
             .map(|s| (s as u32).clamp(1, 300))
             .unwrap_or_else(|| {
-                let dist = (((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt() / 3.0).round();
+                let dist =
+                    (((to.0 - from.0).powi(2) + (to.1 - from.1).powi(2)).sqrt() / 3.0).round();
                 (dist as u32).clamp(24, 300)
             });
 
@@ -194,14 +196,22 @@ async fn parallel_drag_wayland(args: &Value) -> ToolResult {
     for task in tasks {
         let handle = tokio::task::spawn_blocking(move || {
             let from_aimed: crate::wayland::AimedPoint = if let Some(wid) = task.window_id {
-                crate::wayland::window_local_to_output(wid, task.from.0.round() as i32, task.from.1.round() as i32)
-                    .unwrap_or_else(|_| (task.from.0.round() as i32, task.from.1.round() as i32).into())
+                crate::wayland::window_local_to_output(
+                    wid,
+                    task.from.0.round() as i32,
+                    task.from.1.round() as i32,
+                )
+                .unwrap_or_else(|_| (task.from.0.round() as i32, task.from.1.round() as i32).into())
             } else {
                 (task.from.0.round() as i32, task.from.1.round() as i32).into()
             };
             let to_aimed: crate::wayland::AimedPoint = if let Some(wid) = task.window_id {
-                crate::wayland::window_local_to_output(wid, task.to.0.round() as i32, task.to.1.round() as i32)
-                    .unwrap_or_else(|_| (task.to.0.round() as i32, task.to.1.round() as i32).into())
+                crate::wayland::window_local_to_output(
+                    wid,
+                    task.to.0.round() as i32,
+                    task.to.1.round() as i32,
+                )
+                .unwrap_or_else(|_| (task.to.0.round() as i32, task.to.1.round() as i32).into())
             } else {
                 (task.to.0.round() as i32, task.to.1.round() as i32).into()
             };
@@ -525,4 +535,3 @@ mod tests {
         assert_eq!((to_x, to_y), (100.0, 200.0));
     }
 }
-

@@ -1227,9 +1227,10 @@ fn wayland_window_crop(xid: u64, pid: Option<u32>) -> anyhow::Result<WaylandWind
     // When wlr-foreign-toplevel confirms window existence and AT-SPI / list_windows
     // provides the window coordinates rectangle, crop full-screen capture.
     let listed = list_windows_dispatch(pid);
-    if let Some(window) = listed.iter().find(|w| {
-        w.xid == xid || (pid.is_some() && w.pid == pid)
-    }) {
+    if let Some(window) = listed
+        .iter()
+        .find(|w| w.xid == xid || (pid.is_some() && w.pid == pid))
+    {
         if window.width > 0 && window.height > 0 {
             return attested_wayland_crop(
                 xid,
@@ -1242,9 +1243,10 @@ fn wayland_window_crop(xid: u64, pid: Option<u32>) -> anyhow::Result<WaylandWind
         }
     }
     let atspi_windows = wayland_atspi_windows(pid);
-    if let Some(window) = atspi_windows.iter().find(|w| {
-        w.xid == xid || (pid.is_some() && w.pid == pid)
-    }) {
+    if let Some(window) = atspi_windows
+        .iter()
+        .find(|w| w.xid == xid || (pid.is_some() && w.pid == pid))
+    {
         if window.width > 0 && window.height > 0 {
             return attested_wayland_crop(
                 xid,
@@ -4462,7 +4464,7 @@ fn enrich_native_windows(
                 (!claimed.contains(&index)
                     && !native_title.is_empty()
                     && titles_loosely_match(&candidate.title, native_title))
-                    .then_some(index)
+                .then_some(index)
             })
         });
         let app_match = loose_title_match.or_else(|| {
@@ -4487,10 +4489,19 @@ fn enrich_native_windows(
                     let has_pid = c.pid.is_some();
                     let on_screen = c.is_on_screen;
                     let non_zero_bounds = c.width > 0 && c.height > 0;
-                    let title_bonus = !native_title.is_empty() && titles_loosely_match(&c.title, native_title);
+                    let title_bonus =
+                        !native_title.is_empty() && titles_loosely_match(&c.title, native_title);
                     let z = c.z_index.unwrap_or(0);
                     let area = (c.width as u64) * (c.height as u64);
-                    (is_main, has_pid, on_screen, non_zero_bounds, title_bonus, z, area)
+                    (
+                        is_main,
+                        has_pid,
+                        on_screen,
+                        non_zero_bounds,
+                        title_bonus,
+                        z,
+                        area,
+                    )
                 })
             }
         });
@@ -4530,11 +4541,16 @@ fn enrich_native_windows(
         if is_chromium {
             let needs_main_pid = window.pid.map_or(true, |p| !is_main_browser_pid(p));
             if needs_main_pid {
-                if let Some(c) = atspi.iter().find(|c| app_names_match(&c.app_name, &window.app_name) && c.pid.is_some_and(is_main_browser_pid)) {
+                if let Some(c) = atspi.iter().find(|c| {
+                    app_names_match(&c.app_name, &window.app_name)
+                        && c.pid.is_some_and(is_main_browser_pid)
+                }) {
                     window.pid = c.pid;
                 } else {
                     for proc in crate::proc_fs::list_processes() {
-                        if proc.name.to_lowercase().contains("chromium") && is_main_browser_pid(proc.pid) {
+                        if proc.name.to_lowercase().contains("chromium")
+                            && is_main_browser_pid(proc.pid)
+                        {
                             window.pid = Some(proc.pid);
                             break;
                         }
@@ -4542,7 +4558,9 @@ fn enrich_native_windows(
                 }
             }
             if window.width == 0 || window.height == 0 {
-                if let Some(c) = atspi.iter().find(|c| app_names_match(&c.app_name, &window.app_name) && c.width > 0 && c.height > 0) {
+                if let Some(c) = atspi.iter().find(|c| {
+                    app_names_match(&c.app_name, &window.app_name) && c.width > 0 && c.height > 0
+                }) {
                     window.x = c.x;
                     window.y = c.y;
                     window.width = c.width;
@@ -4700,9 +4718,10 @@ pub fn foreign_toplevel_trusted_focus(
         queue.roundtrip(&mut state)?;
     }
 
-    let active_protocol_id = state.toplevels.iter().find_map(|(id, tl)| {
-        (tl.activated && !tl.closed).then_some(*id)
-    });
+    let active_protocol_id = state
+        .toplevels
+        .iter()
+        .find_map(|(id, tl)| (tl.activated && !tl.closed).then_some(*id));
 
     let Some(proto_id) = active_protocol_id else {
         return Ok(None);
@@ -4780,7 +4799,11 @@ pub fn foreign_toplevel_focus_window(
     })?;
 
     let protocol_id = handle.id().protocol_id();
-    if state.toplevels.get(&protocol_id).is_some_and(|tl| tl.activated) {
+    if state
+        .toplevels
+        .get(&protocol_id)
+        .is_some_and(|tl| tl.activated)
+    {
         return Ok(());
     }
 

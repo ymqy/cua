@@ -209,9 +209,7 @@ pub fn with_target_foreground<T>(
             |(), _| crate::wayland::foreign_toplevel_focus_window(pid, window_id, confirm()),
             body,
             |(), (prior_pid, prior_id), cleanup| {
-                let _ = crate::wayland::foreign_toplevel_focus_window(
-                    prior_pid, prior_id, cleanup,
-                );
+                let _ = crate::wayland::foreign_toplevel_focus_window(prior_pid, prior_id, cleanup);
                 Ok(())
             },
         );

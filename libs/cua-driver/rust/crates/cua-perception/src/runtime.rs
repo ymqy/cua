@@ -276,12 +276,7 @@ impl OnnxBackend {
             batched_data.extend_from_slice(&tensor.data);
         }
         let batched_tensor = ImageTensor {
-            shape: [
-                batch_size,
-                3,
-                input_height as usize,
-                input_width as usize,
-            ],
+            shape: [batch_size, 3, input_height as usize, input_width as usize],
             data: batched_data,
             letterbox: crate::preprocess::Letterbox {
                 original_width: input_width,
@@ -314,16 +309,12 @@ impl OnnxBackend {
                 let mut regions = Vec::with_capacity(batch_size);
                 for (i, (detection, _, _, _, _)) in valid_detections.into_iter().enumerate() {
                     let slice = &output[i * item_stride..(i + 1) * item_stride];
-                    let (text, recognition_confidence) = ctc_decode(
-                        slice,
-                        &single_shape,
-                        &self.dictionary,
-                        manifest.blank_index,
-                    )
-                    .map_err(|reason| InferenceError::Output {
-                        model: "ocr_recognizer",
-                        reason,
-                    })?;
+                    let (text, recognition_confidence) =
+                        ctc_decode(slice, &single_shape, &self.dictionary, manifest.blank_index)
+                            .map_err(|reason| InferenceError::Output {
+                                model: "ocr_recognizer",
+                                reason,
+                            })?;
                     if let Some(text) = recognized_text(text) {
                         regions.push(InferenceRegion {
                             kind: "text",

@@ -1665,4 +1665,3 @@ mod tests {
         assert!(!policy.allows("Page.setDocumentContent"));
     }
 }
-

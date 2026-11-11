@@ -4412,6 +4412,7 @@ dependencies = [
  "dirs",
  "evdev",
  "futures-util",
+ "getrandom 0.4.3",
  "image",
  "libc",
  "memmap2",
@@ -4436,6 +4437,7 @@ dependencies = [
  "x11rb",
  "xkbcommon",
  "zbus",
+ "zeroize",
 ]
 
 [[package]]

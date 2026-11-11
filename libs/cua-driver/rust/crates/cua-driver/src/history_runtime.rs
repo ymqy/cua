@@ -204,7 +204,10 @@ pub(crate) fn verify_history_cli_executable_path(path: &Path) -> anyhow::Result<
                 Path::new("/opt/cua-driver"),
                 Path::new("/usr/bin"),
             ];
-            if !allowed_prefixes.iter().any(|prefix| canonical.starts_with(prefix)) {
+            if !allowed_prefixes
+                .iter()
+                .any(|prefix| canonical.starts_with(prefix))
+            {
                 anyhow::bail!("history control peer is not the exact installed Cua Driver helper");
             }
         }

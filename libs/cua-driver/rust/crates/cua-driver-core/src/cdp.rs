@@ -274,7 +274,9 @@ pub async fn set_window_bounds_via_cdp(
     let browser_ws_url = version_info
         .get("webSocketDebuggerUrl")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("CDP /json/version has no webSocketDebuggerUrl on port {port}"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("CDP /json/version has no webSocketDebuggerUrl on port {port}")
+        })?;
 
     let pages = cdp_wait_for_page(port).await?;
     let first_page = pages
@@ -285,7 +287,9 @@ pub async fn set_window_bounds_via_cdp(
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("CDP page target has no id"))?;
 
-    let conn = if let Some(live) = crate::browser::cdp_ws::find_live_endpoint_connection(browser_ws_url).await {
+    let conn = if let Some(live) =
+        crate::browser::cdp_ws::find_live_endpoint_connection(browser_ws_url).await
+    {
         live
     } else {
         match crate::browser::cdp_ws::CdpConnection::connect(browser_ws_url).await {
@@ -316,7 +320,8 @@ pub async fn set_window_bounds_via_cdp(
             "windowState": "normal"
         }
     });
-    conn.call(None, "Browser.setWindowBounds", bounds_params).await?;
+    conn.call(None, "Browser.setWindowBounds", bounds_params)
+        .await?;
 
     let readback_resp = conn
         .call(
@@ -329,10 +334,22 @@ pub async fn set_window_bounds_via_cdp(
         .get("bounds")
         .ok_or_else(|| anyhow::anyhow!("Browser.getWindowBounds returned no bounds"))?;
 
-    let actual_x = bounds.get("left").and_then(Value::as_i64).unwrap_or(x as i64) as i32;
-    let actual_y = bounds.get("top").and_then(Value::as_i64).unwrap_or(y as i64) as i32;
-    let actual_w = bounds.get("width").and_then(Value::as_u64).unwrap_or(width as u64) as u32;
-    let actual_h = bounds.get("height").and_then(Value::as_u64).unwrap_or(height as u64) as u32;
+    let actual_x = bounds
+        .get("left")
+        .and_then(Value::as_i64)
+        .unwrap_or(x as i64) as i32;
+    let actual_y = bounds
+        .get("top")
+        .and_then(Value::as_i64)
+        .unwrap_or(y as i64) as i32;
+    let actual_w = bounds
+        .get("width")
+        .and_then(Value::as_u64)
+        .unwrap_or(width as u64) as u32;
+    let actual_h = bounds
+        .get("height")
+        .and_then(Value::as_u64)
+        .unwrap_or(height as u64) as u32;
 
     Ok((actual_x, actual_y, actual_w, actual_h))
 }
@@ -450,9 +467,15 @@ mod tests {
 
     #[test]
     fn internal_target_urls_are_filtered() {
-        assert!(super::is_internal_target_url("chrome://omnibox-popup.top-chrome/"));
-        assert!(super::is_internal_target_url("chrome-untrusted://new-tab-page/one-google-bar"));
-        assert!(super::is_internal_target_url("devtools://devtools/bundled/devtools_app.html"));
+        assert!(super::is_internal_target_url(
+            "chrome://omnibox-popup.top-chrome/"
+        ));
+        assert!(super::is_internal_target_url(
+            "chrome-untrusted://new-tab-page/one-google-bar"
+        ));
+        assert!(super::is_internal_target_url(
+            "devtools://devtools/bundled/devtools_app.html"
+        ));
         assert!(!super::is_internal_target_url("https://example.com"));
         assert!(!super::is_internal_target_url("chrome://newtab/"));
         assert!(!super::is_internal_target_url("about:blank"));

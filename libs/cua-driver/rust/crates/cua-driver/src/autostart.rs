@@ -590,7 +590,11 @@ mod platform {
 
     fn autostart_desktop_path() -> Option<PathBuf> {
         let home = std::env::var_os("HOME").map(PathBuf::from)?;
-        Some(home.join(".config").join("autostart").join("cua-driver.desktop"))
+        Some(
+            home.join(".config")
+                .join("autostart")
+                .join("cua-driver.desktop"),
+        )
     }
 
     fn is_container_s6_environment() -> bool {
@@ -646,7 +650,9 @@ mod platform {
             fs::write(&desktop, content)?;
             return Ok(());
         }
-        Err(anyhow!("Cannot determine home directory for autostart desktop entry"))
+        Err(anyhow!(
+            "Cannot determine home directory for autostart desktop entry"
+        ))
     }
 
     pub fn disable() -> Result<()> {
@@ -689,7 +695,8 @@ mod platform {
 mod platform {
     use super::*;
 
-    const NOT_YET: &str = "cua-driver autostart is currently Windows and Linux only. macOS users: see \
+    const NOT_YET: &str =
+        "cua-driver autostart is currently Windows and Linux only. macOS users: see \
          libs/cua-driver/scripts/install-local.sh --autostart for the \
          LaunchAgent recipe.";
 
