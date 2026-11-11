@@ -27,7 +27,7 @@ env:
 
 jobs:
   sync:
-    name: Sync upstream/main into ${{ env.TARGET_BRANCH }}
+    name: Sync upstream/main into feat/wayland-with-perception-opt
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -35,7 +35,7 @@ jobs:
       - name: Checkout fork repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.TARGET_BRANCH }}
+          ref: feat/wayland-with-perception-opt
           fetch-depth: 0
 
       - name: Fetch upstream and attempt clean merge
