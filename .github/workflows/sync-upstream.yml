@@ -54,9 +54,7 @@ jobs:
             git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           fi
 
-          # 1. 通过 GitHub 官方服务端 Sync Fork 接口顺带同步 main 分支（不走受 workflow 限制的 git push）
-          gh api -X POST "repos/${GITHUB_REPOSITORY}/merge-upstream" -f branch=main >/dev/null 2>&1 || true
-
+          # 1. 直接从官方仓库拉取最新 main 提交与当前目标分支
           git fetch upstream main
           git fetch origin "${TARGET_BRANCH}"
 
