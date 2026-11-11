@@ -1,0 +1,257 @@
+name: Sync Upstream Main
+
+on:
+  schedule:
+    # 每 6 小时自动检查并同步一次上游最新提交（避开整点队列高峰）
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      auto_merge_conflict_resolution:
+        description: '遇到代码冲突并由 agy 修复后，是否直接合入目标分支（默认 false：提 PR 发通知确认）'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: trycua/cua
+  TARGET_BRANCH: feat/wayland-with-perception-opt
+
+jobs:
+  sync:
+    name: Sync upstream/main into ${{ env.TARGET_BRANCH }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout fork repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Fetch upstream and attempt clean merge
+        id: merge_attempt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "ymqy"
+          git config user.email "22427967+ymqy@users.noreply.github.com"
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          else
+            git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          fi
+
+          git fetch upstream main
+          git fetch origin main "${TARGET_BRANCH}"
+
+          UPSTREAM_SHA=$(git rev-parse upstream/main)
+          UPSTREAM_SHORT=$(git rev-parse --short upstream/main)
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+          echo "upstream_short=${UPSTREAM_SHORT}" >> "$GITHUB_OUTPUT"
+
+          # 1. 保持 fork 的 main 分支与官方 upstream/main 同步
+          git checkout -B main origin/main
+          if ! git merge-base --is-ancestor upstream/main main; then
+            git merge --ff-only upstream/main
+            git push origin main
+            echo "Updated origin/main -> ${UPSTREAM_SHORT}"
+          else
+            echo "origin/main is already at ${UPSTREAM_SHORT}"
+          fi
+
+          # 2. 检查目标分支是否已包含最新 upstream/main
+          git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
+          if git merge-base --is-ancestor main HEAD; then
+            echo "status=up_to_date" >> "$GITHUB_OUTPUT"
+            echo "${TARGET_BRANCH} already contains ${UPSTREAM_SHORT}. Nothing to do."
+            exit 0
+          fi
+
+          # 3. 如果针对当前 upstream commit 已经有待合并的自动同步 PR，避免重复调用 AI
+          EXISTING_PR=$(gh pr list \
+            --state open \
+            --base "${TARGET_BRANCH}" \
+            --json headRefName,url \
+            --jq ".[] | select(.headRefName | startswith(\"auto-sync/${UPSTREAM_SHORT}\")) | .url" \
+            | head -n 1 || true)
+          if [[ -n "${EXISTING_PR}" ]]; then
+            echo "status=pr_already_open" >> "$GITHUB_OUTPUT"
+            echo "An open sync PR already exists for ${UPSTREAM_SHORT}: ${EXISTING_PR}"
+            exit 0
+          fi
+
+          # 4. 尝试合并（先不自动提交，以便自动清理上游自带的 workflows）
+          git merge --no-commit --no-ff main || true
+
+          # 自动移除因上游修改/新增 .github/workflows/*.yml 产生的文件或删改冲突，始终只保留 sync-upstream.yml
+          while IFS= read -r wf; do
+            if [[ -n "$wf" && "$wf" != ".github/workflows/sync-upstream.yml" ]]; then
+              git rm -f --ignore-unmatch -- "$wf"
+            fi
+          done < <(git diff --name-only --diff-filter=U -- '.github/workflows/')
+
+          find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            ! -name 'sync-upstream.yml' \
+            -exec git rm -f --ignore-unmatch -- {} +
+
+          # 5. 检查是否还剩余真正的代码冲突
+          UNMERGED=$(git diff --name-only --diff-filter=U || true)
+          if [[ -z "${UNMERGED}" ]]; then
+            git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
+            git push origin "${TARGET_BRANCH}"
+            echo "status=merged_cleanly" >> "$GITHUB_OUTPUT"
+            echo "Cleanly merged ${UPSTREAM_SHORT} into ${TARGET_BRANCH}."
+          else
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            {
+              echo "conflict_files<<EOF"
+              echo "${UNMERGED}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Real code conflicts detected:"
+            echo "${UNMERGED}"
+          fi
+
+      - name: Install Antigravity CLI (only on conflict)
+        if: steps.merge_attempt.outputs.status == 'conflict'
+        run: |
+          set -euo pipefail
+          curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --skip-aliases --skip-path
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+          mkdir -p "$HOME/.gemini/antigravity-cli"
+          cat > "$HOME/.gemini/antigravity-cli/settings.json" << 'EOF'
+          {
+            "modelProvider": "gemini"
+          }
+          EOF
+
+      - name: Resolve conflicts with agy and notify / merge
+        if: steps.merge_attempt.outputs.status == 'conflict'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGY_CLI_DISABLE_AUTO_UPDATE: "true"
+          AUTO_MERGE_INPUT: ${{ inputs.auto_merge_conflict_resolution }}
+          AUTO_MERGE_VAR: ${{ vars.AUTO_MERGE_CONFLICTS }}
+          UPSTREAM_SHORT: ${{ steps.merge_attempt.outputs.upstream_short }}
+          UPSTREAM_SHA: ${{ steps.merge_attempt.outputs.upstream_sha }}
+          CONFLICT_FILES: ${{ steps.merge_attempt.outputs.conflict_files }}
+        run: |
+          set -euo pipefail
+
+          notify_failure() {
+            local reason="$1"
+            gh issue create \
+              --title "⚠️ 自动同步冲突需人工检查 (${UPSTREAM_SHORT})" \
+              --body "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 合并到 \`${TARGET_BRANCH}\` 时检测到代码冲突，且自动修复未完成。
+
+          **原因**：${reason}
+
+          **冲突文件**：
+          \`\`\`
+          ${CONFLICT_FILES}
+          \`\`\`
+
+          **运行日志**：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
+          }
+
+          if [[ -z "${GEMINI_API_KEY:-}" ]]; then
+            notify_failure "未配置 GEMINI_API_KEY Secret，请前往 Settings -> Secrets and variables -> Actions 添加。"
+            echo "Error: GEMINI_API_KEY secret is not configured." >&2
+            exit 1
+          fi
+
+          PROMPT="当前仓库正处于将 main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。
+          请注意：
+          1. 运行 git status 查看所有处于未合并冲突状态（UU/AA/DU/UD）的文件；
+          2. 阅读冲突文件上下文、git log MERGE_HEAD -n 15（官方最新改动）和当前分支代码意图，谨慎融合双方改动，解决所有冲突标记；
+          3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何文件；
+          4. 检查 git diff --check 确保没有任何残留冲突标记；
+          5. 使用 git add 暂存已解决的文件，并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\" 完成合并提交；
+          6. 用清晰的中文逐个文件简要说明冲突原因与你的解决方式。"
+
+          set +e
+          RESULT=$(agy -p "$PROMPT" \
+            --dangerously-skip-permissions \
+            --effort high \
+            --output-format json \
+            --print-timeout 20m)
+          AGY_EXIT=$?
+          set -e
+
+          if [[ $AGY_EXIT -ne 0 ]]; then
+            ERR_MSG=$(echo "$RESULT" | jq -r '.error // empty' 2>/dev/null || echo "exit code ${AGY_EXIT}")
+            notify_failure "agy 执行返回非零状态：${ERR_MSG}"
+            exit 1
+          fi
+
+          STATUS=$(echo "$RESULT" | jq -r '.status // "ERROR"')
+          SUMMARY=$(echo "$RESULT" | jq -r '.response // ""')
+
+          if [[ "$STATUS" != "SUCCESS" ]]; then
+            ERR_MSG=$(echo "$RESULT" | jq -r '.error // "unknown error"')
+            notify_failure "agy 返回状态 ${STATUS}：${ERR_MSG}"
+            exit 1
+          fi
+
+          # 再次确保没有残留未合并状态或冲突标记，也没有误加回上游 workflows
+          find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            ! -name 'sync-upstream.yml' \
+            -exec git rm -f --ignore-unmatch -- {} +
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
+
+          if [[ -f .git/MERGE_HEAD ]] || [[ -n "$(git diff --name-only --diff-filter=U)" ]] || ! git diff --check; then
+            notify_failure "agy 运行结束但仍存在未解决的合并状态或冲突标记。"
+            exit 1
+          fi
+
+          # 判断是直接合入目标分支，还是提 PR 发邮件通知人工确认
+          if [[ "${AUTO_MERGE_INPUT}" == "true" || "${AUTO_MERGE_VAR}" == "true" ]]; then
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            echo "Auto-merged resolved conflicts directly into ${TARGET_BRANCH}!"
+          else
+            PR_BRANCH="auto-sync/${UPSTREAM_SHORT}-$(date -u +%Y%m%d-%H%M)"
+            git push -u origin "HEAD:refs/heads/${PR_BRANCH}"
+
+            PR_BODY=$(cat <<EOF
+          ## 🤖 自动同步冲突修复报告
+
+          上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`，合并到 \`${TARGET_BRANCH}\` 时出现以下文件冲突，已由 **Antigravity CLI (\`agy\`)** 自动分析并解决：
+
+          ### 冲突文件列表
+          \`\`\`
+          ${CONFLICT_FILES}
+          \`\`\`
+
+          ### AI 解决说明
+          ${SUMMARY}
+
+          ---
+          > 确认代码改动无误后，直接点击下方 **Merge pull request** 即可合入 \`${TARGET_BRANCH}\`。
+          > *(后续若希望跳过人工确认直接自动合入，只需在仓库 \`Settings -> Secrets and variables -> Actions -> Variables\` 中新增变量 \`AUTO_MERGE_CONFLICTS=true\` 即可。)*
+          EOF
+          )
+
+            PR_URL=$(gh pr create \
+              --base "${TARGET_BRANCH}" \
+              --head "${PR_BRANCH}" \
+              --title "chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并解决冲突" \
+              --body "$PR_BODY")
+            echo "Created conflict-resolution PR: ${PR_URL}"
+          fi
