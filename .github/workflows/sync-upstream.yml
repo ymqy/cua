@@ -240,23 +240,47 @@ jobs:
             exit 1
           fi
 
-          # 4. 兜底复核：确保没有误加回上游 workflows，且所有合并冲突已完成提交
+          # 4. 兜底复核：检查冲突文件是否仍有冲突标记、剥离上游 workflows、必要时补交合并提交
+          MARKER_FOUND=""
+          while IFS= read -r cf; do
+            if [[ -n "$cf" && -f "$cf" ]] && grep -nE '^(<<<<<<< |=======$|>>>>>>> )' -- "$cf" >/dev/null 2>&1; then
+              MARKER_FOUND="${MARKER_FOUND}${cf} "
+            fi
+          done <<< "${CONFLICT_FILES}"
+
+          if [[ -n "${MARKER_FOUND}" ]]; then
+            notify_failure "agy 运行结束但以下文件仍残留冲突标记：${MARKER_FOUND}"
+            exit 1
+          fi
+
           find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
             ! -path '.github/workflows/sync-upstream.yml' \
             -exec git rm -f --ignore-unmatch -- {} +
-          if ! git diff --cached --quiet; then
+
+          if [[ -f .git/MERGE_HEAD ]]; then
+            while IFS= read -r cf; do
+              if [[ -n "$cf" && -e "$cf" ]]; then
+                git add -- "$cf"
+              fi
+            done <<< "${CONFLICT_FILES}"
+            if [[ -z "$(git diff --name-only --diff-filter=U)" ]]; then
+              git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
+            fi
+          elif ! git diff --cached --quiet; then
             git commit --amend --no-edit
           fi
 
-          if [[ -f .git/MERGE_HEAD ]] || [[ -n "$(git diff --name-only --diff-filter=U)" ]] || ! git diff --check; then
-            notify_failure "agy 运行结束但仍存在未完成提交的合并状态或残留冲突标记。"
+          if [[ -f .git/MERGE_HEAD ]] || [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+            notify_failure "agy 运行结束但仍存在未完成提交的合并状态。"
             exit 1
           fi
 
           # 5. 根据开关决定直接合入目标分支，还是在本仓库创建 PR 发通知确认
+          RESULT_REF=""
           if [[ "${AUTO_MERGE_INPUT}" == "true" || "${AUTO_MERGE_VAR}" == "true" ]]; then
             git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
             echo "Auto-merged resolved conflicts directly into ${TARGET_BRANCH}!"
+            RESULT_REF="已直接自动合并至 \`${TARGET_BRANCH}\`"
           else
             PR_BRANCH="auto-sync/${UPSTREAM_SHORT}-$(date -u +%Y%m%d-%H%M)"
             git push -u origin "HEAD:refs/heads/${PR_BRANCH}"
@@ -287,4 +311,17 @@ jobs:
               '{title: $title, head: $head, base: $base, body: $body}' \
               | gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" --input - --jq '.html_url')
             echo "Created conflict-resolution PR: ${PR_URL}"
+            RESULT_REF="已自动创建冲突解决 PR：${PR_URL}"
           fi
+
+          # 6. 若之前有自动同步告警 Issue，成功后自动评论并关闭
+          gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
+            --jq '.[] | select(.title | startswith("⚠️ 自动同步冲突需人工检查")) | .number' \
+            | while IFS= read -r inum; do
+                if [[ -n "$inum" ]]; then
+                  jq -n --arg body "✅ 最新同步运行已完成处理（${RESULT_REF}），自动关闭此告警。" '{body: $body}' \
+                    | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${inum}/comments" --input - >/dev/null || true
+                  printf '{"state":"closed"}' \
+                    | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${inum}" --input - >/dev/null || true
+                fi
+              done || true
