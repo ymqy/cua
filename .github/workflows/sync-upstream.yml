@@ -563,7 +563,7 @@ jobs:
                 --settings '{"modelProvider":"gemini"}' \
                 --dangerously-skip-permissions \
                 --output-format json \
-                --print-timeout 8m \
+                --print-timeout 12m \
                 "$@" </dev/null >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
             }
 
@@ -572,9 +572,17 @@ jobs:
             local agy_rc=$?
             local json_status
             json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
-            if [[ $agy_rc -ne 0 || "${json_status}" != "SUCCESS" ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|503|overloaded|model' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
-              echo "Default model hit quota/429 or model access error; sleeping 15s and retrying with gemini-3.8-flash-high..."
-              sleep 15
+
+            if [[ $agy_rc -eq 3 ]] && { ! git diff --quiet || ! git diff --cached --quiet; }; then
+              set -e
+              echo "⚠️ Default model hit print-timeout after modifying workspace files; proceeding to outer deterministic verification..."
+              SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
+              return 0
+            fi
+
+            if [[ $agy_rc -ne 0 || "${json_status}" != "SUCCESS" ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|503|overloaded|model|DEADLINE_EXCEEDED|print_timeout|print timeout' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
+              echo "Default model hit quota/429, timeout, or access error; sleeping 8s and retrying with fast gemini-3.8-flash-high..."
+              sleep 8
               run_once --model gemini-3.8-flash-high
               agy_rc=$?
               json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
@@ -582,9 +590,8 @@ jobs:
             set -e
 
             if [[ $agy_rc -ne 0 ]]; then
-              # 若 agy 已完成源码修改仅在收尾阶段超时，保留其代码改动交由外层确定性测试套件检验
               if [[ $agy_rc -eq 3 ]] && { ! git diff --quiet || ! git diff --cached --quiet; }; then
-                echo "⚠️ agy hit print-timeout after modifying workspace files; proceeding to outer deterministic verification..."
+                echo "⚠️ Fallback model hit print-timeout after modifying workspace files; proceeding to outer deterministic verification..."
                 SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
                 return 0
               fi
@@ -702,7 +709,7 @@ jobs:
               echo "================================================================================"
               echo ""
               echo "请严格遵循以下职责边界快速完成源码修复："
-              echo "1. 直接阅读仓库内的对应源码文件（不要读取 /tmp 外部目录，也**不要**在终端子命令里执行耗时的 cargo build / cargo clippy / cargo test —— 外层流水线会在你返回后立即自动执行 cargo fmt --all 并重跑全套 5 层测试，若还有深层问题会自动进入下一轮反馈给你）；"
+              echo "1. 直接根据报错行号按行区间精准阅读仓库内的对应源码文件与 git log 上下文（遇到数千行的大文件时务必只按行号区间或符号搜索定位，不要逐段通读全文；不要读取 /tmp 外部目录，也**绝对禁止**在终端子命令里执行 cargo build / cargo clippy / cargo check / cargo test —— 外层流水线会在你返回后立即自动执行 cargo fmt --all 并重跑全套 5 层测试，若还有深层问题会自动进入下一轮反馈给你）；"
               echo "2. 结合上下文同时保护上游最新改动与本分支定制能力（Wayland 窗口裁剪/拖拽/焦点、浏览器现有 Profile CDP 绑定、cua-perception 无损与批处理推理、AT-SPI 按钮回退），做最小、地道的等价代码修复；"
               echo "3. 【红线约束】严禁删除、注释或 #[ignore] 任何测试用例，严禁弱化测试断言，严禁添加文件级 #![allow(...)] 掩盖告警，严禁修改 .github/workflows/；"
               echo "4. 完成文件编辑保存即可（外层会自动执行 cargo fmt 与 git commit），最后用简明中文总结本轮修复的问题根因与改动点。"
