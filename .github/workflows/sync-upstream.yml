@@ -45,7 +45,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          git config user.name "ymqy"
+          git config user.name "Ming Ye"
           git config user.email "22427967+ymqy@users.noreply.github.com"
 
           if git remote get-url upstream >/dev/null 2>&1; then
@@ -71,12 +71,9 @@ jobs:
             exit 0
           fi
 
-          # 3. 如果针对当前 upstream commit 已经有待合并的自动同步 PR，避免重复调用 AI
-          EXISTING_PR=$(gh pr list \
-            --state open \
-            --base "${TARGET_BRANCH}" \
-            --json headRefName,url \
-            --jq ".[] | select(.headRefName | startswith(\"auto-sync/${UPSTREAM_SHORT}\")) | .url" \
+          # 3. 检查本仓库（显式指定 repos/${GITHUB_REPOSITORY}，绝不访问上游）是否已有针对该 commit 的待合并 PR
+          EXISTING_PR=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${TARGET_BRANCH}&per_page=50" \
+            --jq ".[] | select(.head.ref | startswith(\"auto-sync/${UPSTREAM_SHORT}\")) | .html_url" \
             | head -n 1 || true)
           if [[ -n "${EXISTING_PR}" ]]; then
             echo "status=pr_already_open" >> "$GITHUB_OUTPUT"
@@ -94,8 +91,8 @@ jobs:
             fi
           done < <(git diff --name-only --diff-filter=U -- '.github/workflows/')
 
-          find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) \
-            ! -name 'sync-upstream.yml' \
+          find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            ! -path '.github/workflows/sync-upstream.yml' \
             -exec git rm -f --ignore-unmatch -- {} +
 
           # 5. 检查是否还剩余真正的代码冲突
@@ -116,21 +113,7 @@ jobs:
             echo "${UNMERGED}"
           fi
 
-      - name: Install Antigravity CLI (only on conflict)
-        if: steps.merge_attempt.outputs.status == 'conflict'
-        run: |
-          set -euo pipefail
-          curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --skip-aliases --skip-path
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-          mkdir -p "$HOME/.gemini/antigravity-cli"
-          cat > "$HOME/.gemini/antigravity-cli/settings.json" << 'EOF'
-          {
-            "modelProvider": "gemini"
-          }
-          EOF
-
-      - name: Resolve conflicts with agy and notify / merge
+      - name: Install agy, resolve conflicts, and notify or merge
         if: steps.merge_attempt.outputs.status == 'conflict'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -146,18 +129,38 @@ jobs:
 
           notify_failure() {
             local reason="$1"
-            gh issue create \
-              --title "⚠️ 自动同步冲突需人工检查 (${UPSTREAM_SHORT})" \
-              --body "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 合并到 \`${TARGET_BRANCH}\` 时检测到代码冲突，且自动修复未完成。
+            local title="⚠️ 自动同步冲突需人工检查 (${UPSTREAM_SHORT})"
 
-          **原因**：${reason}
+            # 避免同一提交重复创建告警 Issue
+            local existing_issue
+            existing_issue=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
+              --jq ".[] | select(.title == \"${title}\") | .html_url" | head -n 1 || true)
+            if [[ -n "${existing_issue}" ]]; then
+              echo "Open alert issue already exists: ${existing_issue}"
+              return 0
+            fi
 
-          **冲突文件**：
-          \`\`\`
-          ${CONFLICT_FILES}
-          \`\`\`
+            {
+              echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 合并到 \`${TARGET_BRANCH}\` 时检测到代码冲突，且自动修复未完成。"
+              echo ""
+              echo "**原因**："
+              echo "\`\`\`"
+              printf '%s\n' "${reason}"
+              echo "\`\`\`"
+              echo ""
+              echo "**冲突文件**："
+              echo "\`\`\`"
+              printf '%s\n' "${CONFLICT_FILES}"
+              echo "\`\`\`"
+              echo ""
+              echo "**运行日志**：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            } > /tmp/sync_issue_body.md
 
-          **运行日志**：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
+            jq -n \
+              --arg title "${title}" \
+              --rawfile body /tmp/sync_issue_body.md \
+              '{title: $title, body: $body}' \
+              | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" --input - >/dev/null || true
           }
 
           if [[ -z "${GEMINI_API_KEY:-}" ]]; then
@@ -166,53 +169,91 @@ jobs:
             exit 1
           fi
 
-          PROMPT="当前仓库正处于将 main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。
-          请注意：
-          1. 运行 git status 查看所有处于未合并冲突状态（UU/AA/DU/UD）的文件；
-          2. 阅读冲突文件上下文、git log MERGE_HEAD -n 15（官方最新改动）和当前分支代码意图，谨慎融合双方改动，解决所有冲突标记；
-          3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何文件；
-          4. 检查 git diff --check 确保没有任何残留冲突标记；
-          5. 使用 git add 暂存已解决的文件，并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\" 完成合并提交；
-          6. 用清晰的中文逐个文件简要说明冲突原因与你的解决方式。"
+          # 1. 安装官方 Antigravity CLI 到 ~/.local/bin/agy
+          mkdir -p "$HOME/.local/bin"
+          if ! curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d "$HOME/.local/bin"; then
+            notify_failure "下载或安装 Antigravity CLI (install.sh) 失败。"
+            exit 1
+          fi
+          export PATH="$HOME/.local/bin:$PATH"
+          if ! command -v agy >/dev/null 2>&1; then
+            notify_failure "安装完成后未在 PATH 中找到 agy 可执行文件。"
+            exit 1
+          fi
+          echo "Installed Antigravity CLI version: $(agy --version)"
+
+          # 2. 配置 Gemini API Key 直连模式并信任当前工作目录
+          mkdir -p "$HOME/.gemini/antigravity-cli"
+          jq -n \
+            --arg ws "${GITHUB_WORKSPACE}" \
+            '{modelProvider: "gemini", trustedWorkspaces: [$ws]}' \
+            > "$HOME/.gemini/antigravity-cli/settings.json"
+
+          # 3. 调用 agy 无头模式分析并解决冲突
+          {
+            echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。"
+            echo "请严格按以下步骤操作："
+            echo "1. 运行 git status 查看所有处于未合并冲突状态（UU/AA/DU/UD）的文件；"
+            echo "2. 阅读冲突文件的完整上下文，并通过 git log MERGE_HEAD -n 15 -- <冲突文件> 查看官方最新改动意图，同时通过 git log HEAD -n 15 -- <冲突文件> 查看本分支（Linux Wayland 与感知优化）的定制改动意图，谨慎融合双方逻辑，确保语法、类型、括号闭合、函数签名和导入完全正确；"
+            echo "3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何工作流文件；"
+            echo "4. 运行 git diff --check 确保没有任何残留冲突标记（<<<<<<<、=======、>>>>>>>）；"
+            echo "5. 使用 git add 暂存已解决的冲突文件，并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\" 完成合并提交；"
+            echo "6. 用清晰的中文逐个文件简要说明冲突原因以及你的融合解决方式（这段说明将直接写入 PR 描述供仓库维护者审阅）。"
+          } > /tmp/agy_prompt.txt
+          PROMPT=$(cat /tmp/agy_prompt.txt)
+
+          run_agy() {
+            agy -p "$PROMPT" \
+              --settings '{"modelProvider":"gemini"}' \
+              --dangerously-skip-permissions \
+              --output-format json \
+              --print-timeout 20m \
+              "$@" >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
+          }
 
           set +e
-          RESULT=$(agy -p "$PROMPT" \
-            --dangerously-skip-permissions \
-            --effort high \
-            --output-format json \
-            --print-timeout 20m)
+          run_agy --effort high
           AGY_EXIT=$?
+          if [[ $AGY_EXIT -ne 0 ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|model' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
+            echo "Default model returned access/quota error; retrying with gemini-3.8-flash-high..."
+            run_agy --model gemini-3.8-flash-high
+            AGY_EXIT=$?
+          fi
           set -e
 
           if [[ $AGY_EXIT -ne 0 ]]; then
-            ERR_MSG=$(echo "$RESULT" | jq -r '.error // empty' 2>/dev/null || echo "exit code ${AGY_EXIT}")
-            notify_failure "agy 执行返回非零状态：${ERR_MSG}"
+            ERR_MSG=$(jq -r '.error // empty' /tmp/agy_stdout.json 2>/dev/null || true)
+            if [[ -z "${ERR_MSG}" ]]; then
+              ERR_MSG=$(tail -n 20 /tmp/agy_stderr.log 2>/dev/null || echo "exit code ${AGY_EXIT}")
+            fi
+            cat /tmp/agy_stderr.log >&2 || true
+            notify_failure "agy 执行返回非零状态（exit ${AGY_EXIT}）：${ERR_MSG}"
             exit 1
           fi
 
-          STATUS=$(echo "$RESULT" | jq -r '.status // "ERROR"')
-          SUMMARY=$(echo "$RESULT" | jq -r '.response // ""')
+          STATUS=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json)
+          SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
 
           if [[ "$STATUS" != "SUCCESS" ]]; then
-            ERR_MSG=$(echo "$RESULT" | jq -r '.error // "unknown error"')
+            ERR_MSG=$(jq -r '.error // "unknown error"' /tmp/agy_stdout.json)
             notify_failure "agy 返回状态 ${STATUS}：${ERR_MSG}"
             exit 1
           fi
 
-          # 再次确保没有残留未合并状态或冲突标记，也没有误加回上游 workflows
-          find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) \
-            ! -name 'sync-upstream.yml' \
+          # 4. 兜底复核：确保没有误加回上游 workflows，且所有合并冲突已完成提交
+          find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
+            ! -path '.github/workflows/sync-upstream.yml' \
             -exec git rm -f --ignore-unmatch -- {} +
           if ! git diff --cached --quiet; then
             git commit --amend --no-edit
           fi
 
           if [[ -f .git/MERGE_HEAD ]] || [[ -n "$(git diff --name-only --diff-filter=U)" ]] || ! git diff --check; then
-            notify_failure "agy 运行结束但仍存在未解决的合并状态或冲突标记。"
+            notify_failure "agy 运行结束但仍存在未完成提交的合并状态或残留冲突标记。"
             exit 1
           fi
 
-          # 判断是直接合入目标分支，还是提 PR 发邮件通知人工确认
+          # 5. 根据开关决定直接合入目标分支，还是在本仓库创建 PR 发通知确认
           if [[ "${AUTO_MERGE_INPUT}" == "true" || "${AUTO_MERGE_VAR}" == "true" ]]; then
             git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
             echo "Auto-merged resolved conflicts directly into ${TARGET_BRANCH}!"
@@ -220,29 +261,30 @@ jobs:
             PR_BRANCH="auto-sync/${UPSTREAM_SHORT}-$(date -u +%Y%m%d-%H%M)"
             git push -u origin "HEAD:refs/heads/${PR_BRANCH}"
 
-            PR_BODY=$(cat <<EOF
-          ## 🤖 自动同步冲突修复报告
+            {
+              echo "## 🤖 自动同步冲突修复报告"
+              echo ""
+              echo "上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`，合并到 \`${TARGET_BRANCH}\` 时出现以下文件冲突，已由 **Antigravity CLI (\`agy\`)** 自动分析并解决："
+              echo ""
+              echo "### 冲突文件列表"
+              echo "\`\`\`"
+              echo "${CONFLICT_FILES}"
+              echo "\`\`\`"
+              echo ""
+              echo "### AI 解决说明"
+              printf '%s\n' "${SUMMARY}"
+              echo ""
+              echo "---"
+              echo "> 确认代码改动无误后，直接点击下方 **Merge pull request** 即可合入 \`${TARGET_BRANCH}\`。"
+              echo "> *(后续若希望跳过人工确认直接自动合入，只需将仓库 \`Settings -> Secrets and variables -> Actions -> Variables\` 中的 \`AUTO_MERGE_CONFLICTS\` 改为 \`true\` 即可。)*"
+            } > /tmp/pr_body.md
 
-          上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`，合并到 \`${TARGET_BRANCH}\` 时出现以下文件冲突，已由 **Antigravity CLI (\`agy\`)** 自动分析并解决：
-
-          ### 冲突文件列表
-          \`\`\`
-          ${CONFLICT_FILES}
-          \`\`\`
-
-          ### AI 解决说明
-          ${SUMMARY}
-
-          ---
-          > 确认代码改动无误后，直接点击下方 **Merge pull request** 即可合入 \`${TARGET_BRANCH}\`。
-          > *(后续若希望跳过人工确认直接自动合入，只需在仓库 \`Settings -> Secrets and variables -> Actions -> Variables\` 中新增变量 \`AUTO_MERGE_CONFLICTS=true\` 即可。)*
-          EOF
-          )
-
-            PR_URL=$(gh pr create \
-              --base "${TARGET_BRANCH}" \
-              --head "${PR_BRANCH}" \
-              --title "chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并解决冲突" \
-              --body "$PR_BODY")
+            PR_URL=$(jq -n \
+              --arg title "chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并解决冲突" \
+              --arg head "${PR_BRANCH}" \
+              --arg base "${TARGET_BRANCH}" \
+              --rawfile body /tmp/pr_body.md \
+              '{title: $title, head: $head, base: $base, body: $body}' \
+              | gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" --input - --jq '.html_url')
             echo "Created conflict-resolution PR: ${PR_URL}"
           fi
