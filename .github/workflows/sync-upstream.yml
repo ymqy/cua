@@ -537,13 +537,19 @@ jobs:
           # 阶段 1：若存在 Git 文本冲突，先由 agy (Argon 主力 / 3.8 Flash 协作) 完成代码融合
           # ====================================================================
           if [[ "${MERGE_STATUS}" == "conflict" ]]; then
+            CONFLICT_DIGEST=$(extract_conflict_context_digest "${CONFLICT_FILES}")
             {
               echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态，以下文件存在冲突标记："
               printf '%s\n' "${CONFLICT_FILES}"
               echo ""
+              echo "以下是外层流水线预先提取的双方非合并提交意图与全部冲突区精确上下文（含 1-indexed 行号及前后相邻辅助函数）："
+              echo "================================================================================"
+              printf '%s\n' "${CONFLICT_DIGEST}"
+              echo "================================================================================"
+              echo ""
               echo "请严格遵循以下职责边界快速完成冲突文件融合："
-              echo "1. 直接按冲突标记位置阅读上述冲突文件上下文，必要时用 git log MERGE_HEAD -n 10 -- <冲突文件> 与 git log HEAD -n 10 -- <冲突文件> 查看双方改动意图；"
-              echo "2. 同时保留上游最新改进与本分支定制逻辑（Linux Wayland / cua-perception / AT-SPI 按钮回退），清除全部 <<<<<<< / ======= / >>>>>>> 冲突标记并保存文件；"
+              echo "1. 上方已给出精确冲突行号与前后辅助函数上下文，请直接定位对应行区间完成编辑保存（严禁通读数千行大文件，也不要再重复执行 grep <<<<<<< 或全仓 git log 搜索；仅当上方代码调用了未展示的函数签名且确需确认类型时，才按行区间或符号定点查阅）；"
+              echo "2. 同时保留上游最新架构改进（如新增辅助函数、状态检查、无干扰关闭态调用语义）与本分支定制逻辑（Linux Wayland / cua-perception / AT-SPI 顶层按钮回退及按钮动作索引回退），清除全部 <<<<<<< / ======= / >>>>>>> 冲突标记并保存文件；"
               echo "3. **绝对禁止**在终端子命令中执行 cargo build / cargo clippy / cargo check / cargo test，也无需手动 git commit（外层流水线会在你返回后立即自动同步 Cargo.lock、执行 cargo fmt、git add/commit 并进入 5 层回归测试闭环）；"
               echo "4. 严禁修改或恢复 .github/workflows/ 下的工作流文件；最后用简明中文说明冲突原因与融合方式。"
             } > /tmp/agy_conflict_prompt.txt

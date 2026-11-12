@@ -304,16 +304,17 @@ workspace_snapshot_hash() {
 }
 
 has_remaining_conflict_markers() {
+  local marker_re='^(<<<<<<<|=======|>>>>>>>|\|\|\|\|\|\|\|)( |$)'
   local cf
   while IFS= read -r cf; do
-    if [[ -n "${cf}" && -f "${cf}" ]] && grep -nE '^(<<<<<<< |=======$|>>>>>>> )' -- "${cf}" >/dev/null 2>&1; then
+    if [[ -n "${cf}" && -f "${cf}" ]] && grep -nE "${marker_re}" -- "${cf}" >/dev/null 2>&1; then
       return 0
     fi
   done <<< "${CONFLICT_FILES:-}"
 
   local scope="${AGY_EDIT_SCOPE:-.}"
   while IFS= read -r cf; do
-    if [[ -n "${cf}" && -f "${cf}" ]] && grep -nE '^(<<<<<<< |=======$|>>>>>>> )' -- "${cf}" >/dev/null 2>&1; then
+    if [[ -n "${cf}" && -f "${cf}" ]] && grep -nE "${marker_re}" -- "${cf}" >/dev/null 2>&1; then
       return 0
     fi
   done < <(
@@ -325,6 +326,193 @@ has_remaining_conflict_markers() {
   )
 
   return 1
+}
+
+extract_conflict_context_digest() {
+  # Pre-extracts 1-indexed conflict hunks + surrounding helper functions + symmetric non-merge
+  # commit logs since merge-base so agy resolves conflicts in 9,000+ line files in 1-2 turns
+  # instead of burning 10+ tool-call turns searching for markers.
+  local files_input="${1:-${CONFLICT_FILES:-}}"
+  CONFLICT_FILES_INPUT="${files_input}" python3 - <<'PY'
+import os
+import subprocess
+from pathlib import Path
+
+raw_files = [
+    ln.strip()
+    for ln in os.environ.get("CONFLICT_FILES_INPUT", "").splitlines()
+    if ln.strip()
+]
+
+
+def git_out(args: list[str]) -> str:
+    res = subprocess.run(args, capture_output=True, text=True)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+merge_base = git_out(["git", "merge-base", "HEAD", "MERGE_HEAD"])
+has_merge_head = bool(git_out(["git", "rev-parse", "--verify", "--quiet", "MERGE_HEAD"]))
+
+BEFORE_CTX = 125
+AFTER_CTX = 45
+COALESCE_GAP = 80
+MAX_LINES_PER_FILE = 450
+MAX_TOTAL_LINES = 950
+
+total_emitted = 0
+out_chunks: list[str] = []
+
+for rel in raw_files:
+    p = Path(rel)
+    if not p.is_file():
+        out_chunks.append(f"=== Conflict File: {rel} (missing/deleted in working tree) ===")
+        continue
+
+    lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+    n_lines = len(lines)
+
+    regions: list[tuple[int, int]] = []
+    cur_start: int | None = None
+    for idx, ln in enumerate(lines, 1):
+        if ln.startswith("<<<<<<<") and (len(ln) == 7 or ln[7] == " "):
+            if cur_start is None:
+                cur_start = idx
+        elif ln.startswith(">>>>>>>") and (len(ln) == 7 or ln[7] == " "):
+            start = cur_start if cur_start is not None else max(1, idx - 20)
+            regions.append((start, idx))
+            cur_start = None
+    if cur_start is not None:
+        regions.append((cur_start, min(n_lines, cur_start + 80)))
+
+    if merge_base and has_merge_head:
+        theirs_log = git_out(
+            ["git", "log", "--no-merges", "--oneline", "-n", "8", f"{merge_base}..MERGE_HEAD", "--", rel]
+        )
+        ours_log = git_out(
+            ["git", "log", "--no-merges", "--oneline", "-n", "8", f"{merge_base}..HEAD", "--", rel]
+        )
+    else:
+        theirs_log = git_out(["git", "log", "--oneline", "-n", "5", "MERGE_HEAD", "--", rel]) if has_merge_head else ""
+        ours_log = git_out(["git", "log", "--oneline", "-n", "5", "HEAD", "--", rel])
+
+    header = [
+        f"=== Conflict File: {rel} (total {n_lines} lines, {len(regions)} conflict block(s)) ===",
+        f"[Upstream MERGE_HEAD commits since merge-base]:\n{theirs_log or '  (none)'}",
+        f"[Fork HEAD commits since merge-base]:\n{ours_log or '  (none)'}",
+    ]
+    out_chunks.append("\n".join(header))
+
+    if not regions or total_emitted >= MAX_TOTAL_LINES:
+        continue
+
+    # Expand and coalesce nearby conflict windows so adjacent helpers & hunks appear seamlessly.
+    windows: list[list[int]] = []
+    for s, e in regions:
+        ws = max(1, s - BEFORE_CTX)
+        we = min(n_lines, e + AFTER_CTX)
+        if windows and ws <= windows[-1][1] + COALESCE_GAP:
+            windows[-1][1] = max(windows[-1][1], we)
+        else:
+            windows.append([ws, we])
+
+    file_emitted = 0
+    for ws, we in windows:
+        budget = min(MAX_LINES_PER_FILE - file_emitted, MAX_TOTAL_LINES - total_emitted)
+        if budget <= 0:
+            out_chunks.append(
+                f"  ... [digest budget reached; inspect lines {ws}-{we} of {rel} directly if needed] ..."
+            )
+            break
+        span_len = we - ws + 1
+        snippet_lines = [f"--- {rel} lines {ws}..{we} (1-indexed) ---"]
+        if span_len <= budget:
+            for ln_no in range(ws, we + 1):
+                snippet_lines.append(f"{ln_no:5d}: {lines[ln_no - 1]}")
+            file_emitted += span_len
+            total_emitted += span_len
+        else:
+            half = max(20, budget // 2)
+            first_end = ws + half - 1
+            second_start = we - (budget - half) + 1
+            for ln_no in range(ws, first_end + 1):
+                snippet_lines.append(f"{ln_no:5d}: {lines[ln_no - 1]}")
+            snippet_lines.append(
+                f"  ... [lines {first_end + 1}..{second_start - 1} omitted for brevity; read that exact range if needed] ..."
+            )
+            for ln_no in range(second_start, we + 1):
+                snippet_lines.append(f"{ln_no:5d}: {lines[ln_no - 1]}")
+            file_emitted += budget
+            total_emitted += budget
+        out_chunks.append("\n".join(snippet_lines))
+
+print("\n\n".join(out_chunks))
+PY
+}
+
+save_agy_workspace_checkpoint() {
+  local ckpt_dir="$1"
+  local scope="${AGY_EDIT_SCOPE:-.}"
+  rm -rf "${ckpt_dir}"
+  mkdir -p "${ckpt_dir}/files"
+
+  local git_dir
+  git_dir=$(git rev-parse --git-dir 2>/dev/null || echo ".git")
+  if [[ -f "${git_dir}/index" ]]; then
+    cp -f "${git_dir}/index" "${ckpt_dir}/git_index"
+  fi
+
+  local df
+  while IFS= read -r df; do
+    if [[ -n "${df}" && -f "${df}" ]]; then
+      mkdir -p "${ckpt_dir}/files/$(dirname "${df}")"
+      cp -f -- "${df}" "${ckpt_dir}/files/${df}"
+    fi
+  done < <(
+    {
+      printf '%s\n' "${CONFLICT_FILES:-}"
+      git diff --name-only -- "${scope}" 2>/dev/null || true
+      git diff --name-only --diff-filter=U 2>/dev/null || true
+    } | sort -u
+  )
+
+  git ls-files --others --exclude-standard -- "${scope}" > "${ckpt_dir}/pre_untracked.txt" 2>/dev/null || true
+}
+
+restore_agy_workspace_checkpoint() {
+  local ckpt_dir="$1"
+  local scope="${AGY_EDIT_SCOPE:-.}"
+  local git_dir
+  git_dir=$(git rev-parse --git-dir 2>/dev/null || echo ".git")
+
+  if [[ -f "${ckpt_dir}/git_index" ]]; then
+    cp -f "${ckpt_dir}/git_index" "${git_dir}/index"
+  fi
+
+  local mf
+  while IFS= read -r mf; do
+    [[ -z "${mf}" ]] && continue
+    if [[ -f "${ckpt_dir}/files/${mf}" ]]; then
+      mkdir -p "$(dirname "${mf}")"
+      cp -f -- "${ckpt_dir}/files/${mf}" "${mf}"
+    else
+      git checkout -- "${mf}" 2>/dev/null || true
+    fi
+  done < <(git diff --name-only -- "${scope}" 2>/dev/null || true)
+
+  local src_file rel
+  while IFS= read -r -d '' src_file; do
+    rel="${src_file#"${ckpt_dir}/files/"}"
+    mkdir -p "$(dirname "${rel}")"
+    cp -f -- "${src_file}" "${rel}"
+  done < <(find "${ckpt_dir}/files" -type f -print0 2>/dev/null || true)
+
+  local uf
+  while IFS= read -r uf; do
+    [[ -z "${uf}" ]] && continue
+    if ! grep -Fxq -- "${uf}" "${ckpt_dir}/pre_untracked.txt" 2>/dev/null; then
+      rm -rf -- "${uf}"
+    fi
+  done < <(git ls-files --others --exclude-standard -- "${scope}" 2>/dev/null || true)
 }
 
 invoke_agy_with_prompt() {
@@ -351,6 +539,9 @@ invoke_agy_with_prompt() {
   }
   write_agy_trusted_settings "${PWD}"
 
+  local ckpt_dir="/tmp/agy_ws_ckpt_$$_${RANDOM}"
+  save_agy_workspace_checkpoint "${ckpt_dir}"
+
   local before_hash
   before_hash=$(workspace_snapshot_hash)
 
@@ -358,13 +549,13 @@ invoke_agy_with_prompt() {
   local -a candidates=()
   if [[ "${tier}" == "fast" ]]; then
     candidates=(
-      "gemini-3.8-flash-high|8m"
-      "gemini-4-argon-high|10m"
+      "gemini-3.8-flash-high|10m"
+      "gemini-4-argon-high|14m"
     )
   else
     candidates=(
-      "gemini-4-argon-high|10m"
-      "gemini-3.8-flash-high|8m"
+      "gemini-4-argon-high|14m"
+      "gemini-3.8-flash-high|12m"
     )
   fi
 
@@ -414,12 +605,14 @@ invoke_agy_with_prompt() {
       else
         SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
         echo "✅ [agy:${cand_model}] Completed edits cleanly."
+        rm -rf "${ckpt_dir}"
         set -e
         return 0
       fi
     elif [[ "${agy_rc}" -eq 3 && "${after_hash}" != "${before_hash}" ]] && ! has_remaining_conflict_markers; then
       echo "⚠️ [agy:${cand_model}] Hit print-timeout (${cand_tmo}) after writing clean workspace edits; proceeding to outer deterministic verification..."
       SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
+      rm -rf "${ckpt_dir}"
       set -e
       return 0
     else
@@ -431,9 +624,12 @@ invoke_agy_with_prompt() {
     fi
 
     if [[ "${idx}" -lt "${total}" ]]; then
+      echo "↩️ Restoring clean pre-invocation workspace checkpoint before trying next pair model..."
+      restore_agy_workspace_checkpoint "${ckpt_dir}"
       sleep 2
     fi
   done
+  rm -rf "${ckpt_dir}"
   set -e
 
   cat /tmp/agy_stderr.log >&2 || true

@@ -164,7 +164,9 @@ jobs:
           export CONFLICT_FILES="libs/greeting.rs"
           export AGY_EDIT_SCOPE="libs"
 
-          PROMPT="文件 libs/greeting.rs 存在 Git 合并冲突。请直接编辑保存 libs/greeting.rs，同时保留 'upstream-telemetry' 与 'wayland-perception' 两项，清除全部冲突标记，不要执行任何终端编译或 git commit 命令，最后简短回复已完成。"
+          DIGEST=$(extract_conflict_context_digest "${CONFLICT_FILES}")
+          grep -q "=== Conflict File: libs/greeting.rs" <<<"${DIGEST}"
+          PROMPT="文件 libs/greeting.rs 存在 Git 合并冲突，冲突摘要如下："$'\n'"${DIGEST}"$'\n\n'"请直接编辑保存 libs/greeting.rs，同时保留 'upstream-telemetry' 与 'wayland-perception' 两项，清除全部冲突标记，不要执行任何终端编译或 git commit 命令，最后简短回复已完成。"
           invoke_agy_with_prompt "${PROMPT}" "fast" "true"
 
           if has_remaining_conflict_markers; then

@@ -748,6 +748,145 @@ class SyncInfraTests(unittest.TestCase):
         finally:
             upstream.close()
 
+    def test_extract_conflict_context_digest_large_file(self):
+        lib_path = WF_DIR / "agy-sync-lib.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            src_dir = repo / "libs"
+            src_dir.mkdir()
+            big_rs = src_dir / "native.rs"
+
+            base_lines = [f"// header padding {i}" for i in range(1, 901)]
+            base_lines.append("fn shared_helper() -> bool { true }")
+            base_lines.extend([f"// mid padding {i}" for i in range(1, 81)])
+            base_lines.append("pub fn invoke_menu_path_in() {")
+            base_lines.append("    let a = 0;")
+            base_lines.extend([f"    // inner {i}" for i in range(1, 21)])
+            base_lines.append("    let b = 0;")
+            base_lines.append("}")
+            base_lines.extend([f"// tail padding {i}" for i in range(1, 901)])
+            big_rs.write_text("\n".join(base_lines) + "\n", encoding="utf-8")
+
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+            # Fork branch modifies lines and adds a noisy merge commit on top
+            subprocess.run(["git", "checkout", "-b", "fork"], cwd=repo, check=True, capture_output=True)
+            fork_text = big_rs.read_text(encoding="utf-8").replace(
+                "    let a = 0;", "    let a = action_button_fallback();"
+            ).replace("    let b = 0;", "    let b = button_index_fallback();")
+            big_rs.write_text(fork_text, encoding="utf-8")
+            subprocess.run(
+                ["git", "commit", "-am", "feat(linux): fork menu action button fallback"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            # Upstream main extracts helper right above invoke_menu_path_in and changes both lines
+            subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+            up_text = big_rs.read_text(encoding="utf-8").replace(
+                "fn shared_helper() -> bool { true }",
+                "fn resolve_menu_segment() -> Option<usize> { Some(0) }",
+            ).replace(
+                "    let a = 0;", "    let a = resolve_menu_segment();"
+            ).replace("    let b = 0;", "    let b = fire_menu_node();")
+            big_rs.write_text(up_text, encoding="utf-8")
+            subprocess.run(
+                ["git", "commit", "-am", "fix(driver): upstream background invoke_menu"],
+                cwd=repo,
+                check=True,
+                capture_output=True,
+            )
+
+            subprocess.run(["git", "checkout", "fork"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "merge", "--no-commit", "--no-ff", "main"], cwd=repo, capture_output=True)
+
+            digest = subprocess.check_output(
+                [
+                    "bash",
+                    "-c",
+                    f"source {shlex.quote(str(lib_path))} && extract_conflict_context_digest 'libs/native.rs'",
+                ],
+                cwd=repo,
+                text=True,
+            )
+
+            self.assertIn("2 conflict block(s)", digest)
+            self.assertIn("fork menu action button fallback", digest)
+            self.assertIn("upstream background invoke_menu", digest)
+            # Helper ~82 lines above `<<<<<<<` MUST be included inside the coalesced 1-indexed window:
+            self.assertIn("fn resolve_menu_segment() -> Option<usize>", digest)
+            self.assertIn("<<<<<<< HEAD", digest)
+            self.assertIn(">>>>>>> main", digest)
+            # Digest must stay compact (<300 lines) rather than dumping all ~1,900 lines!
+            self.assertLess(len(digest.splitlines()), 300)
+
+    def test_workspace_checkpoint_restore_between_candidates(self):
+        lib_path = WF_DIR / "agy-sync-lib.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            ckpt = Path(tmp) / "ckpt"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            libs = repo / "libs"
+            libs.mkdir()
+            (libs / "clean.rs").write_text("pub fn clean() -> i32 { 0 }\n", encoding="utf-8")
+            (libs / "conf.rs").write_text("pub fn conf() -> i32 { 0 }\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+            subprocess.run(["git", "checkout", "-b", "fork"], cwd=repo, check=True, capture_output=True)
+            (libs / "conf.rs").write_text("pub fn conf() -> i32 { 1 }\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "fork"], cwd=repo, check=True, capture_output=True)
+
+            subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+            (libs / "clean.rs").write_text("pub fn clean() -> i32 { 42 }\n", encoding="utf-8")
+            (libs / "conf.rs").write_text("pub fn conf() -> i32 { 2 }\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "main"], cwd=repo, check=True, capture_output=True)
+
+            subprocess.run(["git", "checkout", "fork"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "merge", "--no-commit", "--no-ff", "main"], cwd=repo, capture_output=True)
+
+            script = f"""
+            set -euo pipefail
+            export AGY_EDIT_SCOPE="libs"
+            export CONFLICT_FILES="libs/conf.rs"
+            source {shlex.quote(str(lib_path))}
+            H_BEFORE=$(workspace_snapshot_hash)
+            save_agy_workspace_checkpoint {shlex.quote(str(ckpt))}
+
+            # Simulate timed-out candidate 1 leaving half-broken edits, staging conf.rs, corrupting clean.rs & creating stray.rs:
+            printf 'half broken <<<<<<< HEAD\\n' > libs/conf.rs
+            git add libs/conf.rs
+            printf 'corrupted clean file\\n' > libs/clean.rs
+            printf 'untracked garbage\\n' > libs/stray.rs
+
+            H_DIRTY=$(workspace_snapshot_hash)
+            [[ "${{H_DIRTY}}" != "${{H_BEFORE}}" ]]
+
+            restore_agy_workspace_checkpoint {shlex.quote(str(ckpt))}
+            H_RESTORED=$(workspace_snapshot_hash)
+            [[ "${{H_RESTORED}}" == "${{H_BEFORE}}" ]]
+            """
+            subprocess.run(["bash", "-c", script], cwd=repo, check=True)
+
+            unmerged = subprocess.check_output(
+                ["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo, text=True
+            ).strip()
+            self.assertEqual(unmerged, "libs/conf.rs")
+            self.assertIn("<<<<<<< HEAD", (libs / "conf.rs").read_text(encoding="utf-8"))
+            self.assertEqual((libs / "clean.rs").read_text(encoding="utf-8"), "pub fn clean() -> i32 { 42 }\n")
+            self.assertFalse((libs / "stray.rs").exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

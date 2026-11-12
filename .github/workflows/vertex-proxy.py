@@ -41,7 +41,7 @@ class BridgeState:
         self.explicit_location = explicit_location.strip() or "global"
         self.upstream_override = os.environ.get("VERTEX_UPSTREAM_BASE_URL", "").strip().rstrip("/")
         self.backoff_secs = _parse_backoff()
-        self.socket_timeout = float(os.environ.get("VERTEX_SOCKET_TIMEOUT_SECS", "240"))
+        self.socket_timeout = float(os.environ.get("VERTEX_SOCKET_TIMEOUT_SECS", "150"))
         self.lock = threading.Lock()
         self.discovered_project = ""
         self.stats = {
