@@ -10,12 +10,12 @@ on:
   workflow_dispatch:
     inputs:
       auto_merge_conflict_resolution:
-        description: '遇到冲突或语义适配并由 agy 修复通过测试后，是否直接合入目标分支（默认 false：提 PR 确认）'
+        description: '遇到冲突或测试修复并由 agy 通过全量测试后，是否直接合入目标分支（默认 false：提 PR 确认）'
         required: false
         default: false
         type: boolean
       verify_ref:
-        description: '仅针对指定分支或 Commit SHA 运行双向编译与回归测试（留空则执行正常上游同步）'
+        description: '仅针对指定分支或 Commit SHA 运行只读双向回归测试（留空则执行自动同步与自动修复闭环）'
         required: false
         default: ''
         type: string
@@ -43,10 +43,10 @@ env:
 
 jobs:
   sync:
-    name: Sync upstream/main into feat/wayland-with-perception-opt
+    name: Sync upstream/main with Closed-Loop Auto-Heal & Verification
     if: github.event_name != 'pull_request' && inputs.verify_ref == ''
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
 
     steps:
       - name: Checkout fork repository
@@ -55,7 +55,7 @@ jobs:
           ref: feat/wayland-with-perception-opt
           fetch-depth: 0
 
-      - name: Fetch upstream and attempt merge
+      - name: Fetch upstream and prepare sync or PR self-heal state
         id: merge_attempt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -65,13 +65,17 @@ jobs:
           git config user.name "Ming Ye"
           git config user.email "22427967+ymqy@users.noreply.github.com"
 
+          # 先把主分支最新的 5 层双向验证脚本复制到 /tmp，确保检出任意分支/状态时始终可用且不污染工作区
+          cp .github/workflows/verify-fork-driver.sh /tmp/verify-fork-driver.sh
+          chmod +x /tmp/verify-fork-driver.sh
+
           if git remote get-url upstream >/dev/null 2>&1; then
             git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
           else
             git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           fi
 
-          # 1. 直接从官方仓库拉取最新 main 提交与当前目标分支
+          # 1. 拉取官方最新 main 与当前目标分支
           git fetch upstream main
           git fetch origin "${TARGET_BRANCH}"
 
@@ -80,7 +84,7 @@ jobs:
           echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
           echo "upstream_short=${UPSTREAM_SHORT}" >> "$GITHUB_OUTPUT"
 
-          # 2. 检查目标分支是否已包含最新 upstream/main（无更新时 ~5s 极速退出，不装依赖）
+          # 2. 检查目标分支是否已包含最新 upstream/main（无更新时 ~5s 极速退出）
           git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "status=up_to_date" >> "$GITHUB_OUTPUT"
@@ -88,20 +92,41 @@ jobs:
             exit 0
           fi
 
-          # 3. 检查本仓库是否已有针对该上游 commit 的待合并 PR
-          EXISTING_PR=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${TARGET_BRANCH}&per_page=50" \
-            --jq ".[] | select(.head.ref | startswith(\"auto-sync/${UPSTREAM_SHORT}\")) | .html_url" \
-            | head -n 1 || true)
-          if [[ -n "${EXISTING_PR}" ]]; then
-            echo "status=pr_already_open" >> "$GITHUB_OUTPUT"
-            echo "An open sync PR already exists for ${UPSTREAM_SHORT}: ${EXISTING_PR}"
+          # 3. 检查本仓库是否已有针对该上游 commit 的待合并 auto-sync PR：
+          #    - 若该 PR 已经通过 5 层测试（status == success），直接极速退出等待人工合并；
+          #    - 若该 PR 尚未通过测试（failure / pending / none），自动检出该 PR 分支进入 AI 自愈闭环！
+          EXISTING_PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${TARGET_BRANCH}&per_page=50" \
+            --jq "[.[] | select(.head.ref | startswith(\"auto-sync/${UPSTREAM_SHORT}\"))][0] // empty" || true)
+          if [[ -n "${EXISTING_PR_JSON}" ]]; then
+            EXISTING_PR_NUM=$(jq -r '.number' <<<"${EXISTING_PR_JSON}")
+            EXISTING_PR_URL=$(jq -r '.html_url' <<<"${EXISTING_PR_JSON}")
+            EXISTING_PR_REF=$(jq -r '.head.ref' <<<"${EXISTING_PR_JSON}")
+            EXISTING_PR_SHA=$(jq -r '.head.sha' <<<"${EXISTING_PR_JSON}")
+
+            VERIFIED_STATE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${EXISTING_PR_SHA}/status" \
+              --jq "[.statuses[] | select(.context == \"${VERIFY_STATUS_CONTEXT}\")][0].state // \"none\"" || echo "none")
+
+            if [[ "${VERIFIED_STATE}" == "success" ]]; then
+              echo "status=pr_already_open" >> "$GITHUB_OUTPUT"
+              echo "Open sync PR #${EXISTING_PR_NUM} (${EXISTING_PR_URL}) already passed all verification checks. Waiting for review."
+              exit 0
+            fi
+
+            echo "Open sync PR #${EXISTING_PR_NUM} (${EXISTING_PR_REF}) has verification state '${VERIFIED_STATE}'; checking out for closed-loop auto-healing..."
+            git fetch origin "${EXISTING_PR_REF}"
+            git checkout -B "${EXISTING_PR_REF}" "origin/${EXISTING_PR_REF}"
+            {
+              echo "status=heal_existing_pr"
+              echo "existing_pr_num=${EXISTING_PR_NUM}"
+              echo "existing_pr_ref=${EXISTING_PR_REF}"
+              echo "existing_pr_url=${EXISTING_PR_URL}"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 4. 尝试将 upstream/main 合并进目标分支（先不推送，必须经过双向测试验证后再推送）
+          # 4. 尝试将 upstream/main 合并进目标分支（绝不直接推送！即使无文本冲突也必须先通过 5 层测试）
           git merge --no-commit --no-ff upstream/main || true
 
-          # 自动移除因上游修改/新增 .github/workflows/*.yml 产生的文件或删改冲突，始终保留 sync-upstream.yml 与 verify-fork-driver.sh
           while IFS= read -r wf; do
             if [[ -n "$wf" && "$wf" != ".github/workflows/sync-upstream.yml" && "$wf" != ".github/workflows/verify-fork-driver.sh" ]]; then
               git rm -f --ignore-unmatch -- "$wf"
@@ -112,12 +137,12 @@ jobs:
             ! -path '.github/workflows/sync-upstream.yml' \
             -exec git rm -f --ignore-unmatch -- {} +
 
-          # 5. 检查是否剩余代码文本冲突（即使无文本冲突也只本地 commit，待测试通过后再 push）
+          # 5. 检查是否存在 Git 文本冲突
           UNMERGED=$(git diff --name-only --diff-filter=U || true)
           if [[ -z "${UNMERGED}" ]]; then
             git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
             echo "status=merged_cleanly" >> "$GITHUB_OUTPUT"
-            echo "Cleanly merged ${UPSTREAM_SHORT} locally; proceeding to bidirectional test verification before push."
+            echo "Cleanly merged ${UPSTREAM_SHORT} locally; entering 5-layer verification & auto-heal loop."
           else
             echo "status=conflict" >> "$GITHUB_OUTPUT"
             {
@@ -125,18 +150,18 @@ jobs:
               echo "${UNMERGED}"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-            echo "Real code conflicts detected:"
+            echo "Real Git conflicts detected:"
             echo "${UNMERGED}"
           fi
 
       - name: Free runner disk space
-        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
         uses: ./.github/actions/linux-rust-prep
         with:
           install-deps: "false"
 
       - name: Install pinned Rust toolchain with rustfmt and clippy
-        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
         run: |
           set -euo pipefail
           TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' libs/cua-driver/rust/rust-toolchain.toml)
@@ -145,14 +170,14 @@ jobs:
           rustup toolchain install "${TOOLCHAIN}" --profile minimal --component rustfmt --component clippy
 
       - name: Configure Rust sccache
-        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
         uses: ./.github/actions/rust-cache
         with:
           workspaces: "libs/cua-driver/rust -> target"
           pr-save: "true"
 
       - name: Install Linux build and headless desktop dependencies
-        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
         uses: ./.github/actions/apt-install
         with:
           packages: >-
@@ -164,8 +189,8 @@ jobs:
             xvfb xauth x11-utils xdotool dbus-daemon dbus-x11 at-spi2-core
             openbox picom python3-gi gir1.2-gtk-3.0 imagemagick ffmpeg
 
-      - name: Resolve conflicts, run bidirectional verification, and publish
-        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+      - name: Closed-loop conflict resolution, 5-layer test verification, AI self-healing, and publish
+        if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
         env:
           VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
           VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
@@ -178,13 +203,18 @@ jobs:
           UPSTREAM_SHORT: ${{ steps.merge_attempt.outputs.upstream_short }}
           UPSTREAM_SHA: ${{ steps.merge_attempt.outputs.upstream_sha }}
           CONFLICT_FILES: ${{ steps.merge_attempt.outputs.conflict_files }}
+          EXISTING_PR_NUM: ${{ steps.merge_attempt.outputs.existing_pr_num }}
+          EXISTING_PR_REF: ${{ steps.merge_attempt.outputs.existing_pr_ref }}
+          EXISTING_PR_URL: ${{ steps.merge_attempt.outputs.existing_pr_url }}
         run: |
           set -euo pipefail
 
+          MAX_REPAIR_ROUNDS=3
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           VERTEX_PROXY_PID=""
           VERTEX_PROXY_PORT=""
           SUMMARY=""
+          AI_LOG_SECTIONS=""
 
           cleanup() {
             if [[ -n "${VERTEX_PROXY_PID}" ]]; then
@@ -206,13 +236,40 @@ jobs:
               | gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${sha}" --input - >/dev/null || true
           }
 
+          upsert_pr_verify_comment() {
+            local pr_num="$1"
+            local extra_notes="${2:-}"
+            local marker="<!-- cua-fork-verify-report -->"
+            {
+              echo "${marker}"
+              if [[ -n "${extra_notes}" ]]; then
+                echo "### 🛠️ 自动测试自愈记录"
+                printf '%s\n\n' "${extra_notes}"
+              fi
+              cat /tmp/verify_report.md
+              echo ""
+              echo "🔗 [查看完整 Actions 运行日志](${RUN_URL})"
+            } > /tmp/pr_verify_comment.md
+
+            local existing_cid
+            existing_cid=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments?per_page=50" \
+              --jq ".[] | select(.body | contains(\"${marker}\")) | .id" | head -n 1 || true)
+            if [[ -n "${existing_cid}" ]]; then
+              jq -n --rawfile body /tmp/pr_verify_comment.md '{body: $body}' \
+                | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${existing_cid}" --input - >/dev/null || true
+            else
+              jq -n --rawfile body /tmp/pr_verify_comment.md '{body: $body}' \
+                | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments" --input - >/dev/null || true
+            fi
+          }
+
           close_stale_alert_issues() {
             local msg="$1"
             gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
               --jq '.[] | select(.title | startswith("⚠️ 自动同步")) | .number' \
               | while IFS= read -r inum; do
                   if [[ -n "$inum" ]]; then
-                    jq -n --arg body "✅ 最新同步运行已完成处理且通过全部双向测试（${msg}），自动关闭此告警。" '{body: $body}' \
+                    jq -n --arg body "✅ 最新自动同步闭环已完成修复并通过全部 5 层双向回归测试（${msg}），自动关闭此告警。" '{body: $body}' \
                       | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${inum}/comments" --input - >/dev/null || true
                     printf '{"state":"closed"}' \
                       | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${inum}" --input - >/dev/null || true
@@ -225,7 +282,7 @@ jobs:
             local title="⚠️ 自动同步冲突或测试未通过需人工检查 (${UPSTREAM_SHORT})"
 
             {
-              echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 合并到 \`${TARGET_BRANCH}\` 时未能通过自动冲突修复或双向回归测试，**未向目标分支推送未验证代码**。"
+              echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 同步到 \`${TARGET_BRANCH}\` 时，自动闭环（最多 ${MAX_REPAIR_ROUNDS} 轮编译/测试自愈）未能完全修复所有问题，**已拦截推送以保护目标分支**。"
               echo ""
               echo "**失败原因**："
               echo "\`\`\`"
@@ -233,16 +290,16 @@ jobs:
               echo "\`\`\`"
               if [[ -n "${CONFLICT_FILES:-}" ]]; then
                 echo ""
-                echo "**冲突文件**："
+                echo "**Git 冲突文件**："
                 echo "\`\`\`"
                 printf '%s\n' "${CONFLICT_FILES}"
                 echo "\`\`\`"
               fi
               if [[ -s /tmp/verify_failure.log ]]; then
                 echo ""
-                echo "**编译 / 测试错误日志摘要**："
+                echo "**最后一次编译 / 测试错误摘要**："
                 echo "\`\`\`text"
-                tail -n 100 /tmp/verify_failure.log
+                head -n 140 /tmp/verify_failure.log
                 echo "\`\`\`"
               fi
               echo ""
@@ -272,23 +329,23 @@ jobs:
             fi
 
             if [[ -z "${VERTEX_API_KEY:-}" ]]; then
-              notify_failure "未配置 VERTEX_API_KEY Secret，无法调用 agy 自动修复冲突或语义破坏。"
+              notify_failure "未配置 VERTEX_API_KEY Secret，无法启动 agy 自动修复冲突或测试失败。"
               exit 1
             fi
 
             mkdir -p "$HOME/.local/bin"
+            export PATH="$HOME/.local/bin:$PATH"
             if ! command -v agy >/dev/null 2>&1; then
               if ! curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d "$HOME/.local/bin"; then
                 notify_failure "下载或安装 Antigravity CLI (install.sh) 失败。"
                 exit 1
               fi
-              export PATH="$HOME/.local/bin:$PATH"
             fi
             if ! command -v agy >/dev/null 2>&1; then
               notify_failure "安装完成后未在 PATH 中找到 agy 可执行文件。"
               exit 1
             fi
-            echo "Installed Antigravity CLI version: $(agy --version)"
+            echo "Using Antigravity CLI: $(agy --version)"
 
             cat <<'PY' > /tmp/vertex_proxy.py
           #!/usr/bin/env python3
@@ -516,60 +573,19 @@ jobs:
           }
 
           # ====================================================================
-          # 路径 A：Git 文本层面无冲突合并 —— 先跑双向编译与回归测试拦截“语义冲突”
+          # 阶段 1：若存在 Git 文本冲突，先由 agy 完成代码融合提交
           # ====================================================================
-          if [[ "${MERGE_STATUS}" == "merged_cleanly" ]]; then
-            if bash .github/workflows/verify-fork-driver.sh; then
-              cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY"
-              git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
-              MERGED_SHA=$(git rev-parse HEAD)
-              post_commit_status "${MERGED_SHA}" "success" "Clean merge verified: fmt + clippy + unit + Wayland + GTK3 AT-SPI passed"
-              close_stale_alert_issues "已无冲突合入 \`${TARGET_BRANCH}\` 并通过全部 5 层测试"
-              echo "Clean merge passed all 5 verification layers and was pushed to ${TARGET_BRANCH}!"
-              exit 0
-            fi
-
-            echo "⚠️ Clean Git merge failed bidirectional compile/test suite (semantic conflict)! Invoking agy to adapt..."
-            {
-              echo "当前仓库已将 upstream/main (${UPSTREAM_SHORT}) 无文本冲突合并进 ${TARGET_BRANCH}（位于当前 HEAD），但运行双向编译与回归测试未通过（出现了跨模块签名变更、Clippy 报错或回归测试失败）。"
-              echo "失败详情保存在 /tmp/verify_failure.log 中。"
-              echo "请严格按以下步骤修复："
-              echo "1. 阅读 /tmp/verify_failure.log，结合 git log HEAD^1 -n 10 与 git log HEAD^2 -n 10 理解本分支（Linux Wayland / cua-perception 定制）与上游最新改动的意图，做最小且准确的兼容修复；"
-              echo "2. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何 .yml/.yaml 文件；"
-              echo "3. 运行 cargo fmt --manifest-path libs/cua-driver/rust/Cargo.toml --all 确保格式完全合规；"
-              echo "4. 使用 git add 暂存修改并执行 git commit --amend --no-edit 更新当前合并提交；"
-              echo "5. 用清晰的中文说明导致测试失败的语义冲突原因以及你的适配方式（将写入 PR 描述）。"
-            } > /tmp/agy_semantic_prompt.txt
-
-            invoke_agy_with_prompt "$(cat /tmp/agy_semantic_prompt.txt)"
-            clean_extra_workflows
-            if ! git diff --quiet || ! git diff --cached --quiet; then
-              git add -u
-              git commit --amend --no-edit
-            fi
-
-            if ! bash .github/workflows/verify-fork-driver.sh; then
-              cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY" || true
-              notify_failure "无文本冲突合并触发语义/测试报错，经 agy 自动修复后仍未通过双向测试套件。"
-              exit 1
-            fi
-
-            PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并完成语义兼容适配"
-            PR_INTRO="上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`。Git 文本合并无冲突，但双向编译/回归测试捕获到跨侧语义影响，已由 **Antigravity CLI (\`agy\`)** 完成兼容适配并通过全部测试："
-          else
-            # ==================================================================
-            # 路径 B：Git 存在文本冲突 —— agy 解决冲突 + 跑全套双向测试（失败则二次修复）
-            # ==================================================================
+          if [[ "${MERGE_STATUS}" == "conflict" ]]; then
             {
               echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。"
-              echo "当前环境已预装完整的 Rust 工具链（cargo / rustfmt / clippy）及 Linux 系统开发库。"
+              echo "当前机器已安装完整 Rust 工具链（cargo / rustfmt / clippy，已开启 sccache 缓存）及 Linux 桌面依赖库。"
               echo "请严格按以下步骤操作："
               echo "1. 运行 git status 查看所有处于未合并冲突状态（UU/AA/DU/UD）的文件；"
-              echo "2. 阅读冲突文件的完整上下文，通过 git log MERGE_HEAD -n 15 -- <冲突文件> 查看官方最新改动意图，同时通过 git log HEAD -n 15 -- <冲突文件> 查看本分支（Linux Wayland 与感知优化）的定制改动意图，谨慎融合双方逻辑；"
+              echo "2. 阅读冲突文件的完整上下文，通过 git log MERGE_HEAD -n 15 -- <冲突文件> 理解官方最新改动意图，同时通过 git log HEAD -n 15 -- <冲突文件> 理解本分支（Linux Wayland 与 cua-perception 定制）的改动意图，谨慎融合双方逻辑；"
               echo "3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何 .yml/.yaml 工作流文件；"
-              echo "4. 运行 cargo fmt --manifest-path libs/cua-driver/rust/Cargo.toml --all 格式化代码，并运行 git diff --check 确保无任何残留冲突标记；"
+              echo "4. 在 libs/cua-driver/rust 下运行 cargo fmt --all 格式化代码，并运行 git diff --check 确保无任何残留冲突标记；"
               echo "5. 使用 git add 暂存已解决的冲突文件，并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\" 完成合并提交；"
-              echo "6. 用清晰的中文逐个文件简要说明冲突原因以及你的融合解决方式（这段说明将直接写入 PR 描述供仓库维护者审阅）。"
+              echo "6. 用清晰的中文逐个文件简要说明冲突原因以及你的融合解决方式。"
             } > /tmp/agy_conflict_prompt.txt
 
             invoke_agy_with_prompt "$(cat /tmp/agy_conflict_prompt.txt)"
@@ -606,73 +622,142 @@ jobs:
               exit 1
             fi
 
-            # 运行 5 层双向验证；若首次未通过（例如格式缩进、Clippy 警告或单测断言），交给 agy 根据错误日志做一次精准修复
-            if ! bash .github/workflows/verify-fork-driver.sh; then
-              echo "⚠️ First verification pass failed after conflict resolution; invoking agy with /tmp/verify_failure.log..."
-              PREV_SUMMARY="${SUMMARY}"
-              {
-                echo "合并提交已完成，但运行双向编译、Clippy 与回归测试套件未通过，错误日志保存在 /tmp/verify_failure.log。"
-                echo "请按以下步骤修复："
-                echo "1. 阅读 /tmp/verify_failure.log 定位编译、格式、Clippy 或测试失败根因并修复，确保同时保留上游新逻辑与本分支定制能力；"
-                echo "2. 运行 cargo fmt --manifest-path libs/cua-driver/rust/Cargo.toml --all；"
-                echo "3. 执行 git add -u && git commit --amend --no-edit 更新当前合并提交；"
-                echo "4. 用中文简要补充本次编译/测试修复点。"
-              } > /tmp/agy_repair_prompt.txt
+            AI_LOG_SECTIONS="#### 1. Git 冲突融合说明"$'\n'"${SUMMARY}"
+          fi
 
-              invoke_agy_with_prompt "$(cat /tmp/agy_repair_prompt.txt)"
-              clean_extra_workflows
-              if ! git diff --quiet || ! git diff --cached --quiet; then
-                git add -u
+          # ====================================================================
+          # 阶段 2：统一的「5 层双向编译测试 -> AI 自动修复 -> 重跑验证」多轮自愈闭环
+          # 无论 Git 合并是否有文本冲突，都必须通过全部 5 层测试！
+          # ====================================================================
+          REPAIR_ROUND=0
+          VERIFIED_OK="false"
+
+          while true; do
+            echo ""
+            echo ">>> Executing 5-layer bidirectional verification (repair round ${REPAIR_ROUND}/${MAX_REPAIR_ROUNDS})..."
+            if bash /tmp/verify-fork-driver.sh; then
+              VERIFIED_OK="true"
+              break
+            fi
+
+            if [[ "${REPAIR_ROUND}" -ge "${MAX_REPAIR_ROUNDS}" ]]; then
+              echo "❌ Reached maximum auto-repair rounds (${MAX_REPAIR_ROUNDS}) without passing all 5 test layers." >&2
+              break
+            fi
+
+            REPAIR_ROUND=$((REPAIR_ROUND + 1))
+            echo "⚠️ Verification failed! Starting automated AI self-healing round ${REPAIR_ROUND}/${MAX_REPAIR_ROUNDS}..."
+
+            {
+              echo "当前分支在同步上游 main (${UPSTREAM_SHORT}) 后运行 5 层双向编译与回归测试未通过（第 ${REPAIR_ROUND}/${MAX_REPAIR_ROUNDS} 轮自动修复）。"
+              echo "关键错误摘要已提取在 /tmp/verify_failure.log，完整原始日志在 /tmp/verify_step_raw.log。"
+              echo ""
+              echo "请严格遵循以下工程准则完成自动修复："
+              echo "1. 先阅读 /tmp/verify_failure.log（必要时查看 /tmp/verify_step_raw.log）定位所有编译错误、rustfmt 格式差异、Clippy (-D warnings) 告警或单元/桌面回归测试失败的根因；"
+              echo "2. 结合 git log -n 10 理解上游改动（如 Rust 编译器升级、签名变更、行为契约调整）与本仓库定制改动（Wayland 窗口裁剪/拖拽/焦点、浏览器现有 Profile CDP 绑定、cua-perception 无损与批处理推理、AT-SPI 按钮回退）的双方意图，做最小且地道的代码修复；"
+              echo "3. 【红线约束】严禁删除、注释或 #[ignore] 任何现有测试用例，严禁弱化测试断言，严禁在文件/模块顶部粗暴添加 #![allow(...)] 掩盖问题；"
+              echo "4. 【本地自检】当前环境已配置好 cargo / clippy / rustfmt 与 sccache 缓存，请在完成修改后直接在 libs/cua-driver/rust 目录下运行针对性的检查命令（例如 cargo fmt --all 以及报错对应的 cargo clippy --locked -p <crate> --all-targets -- -D warnings 或 cargo test --locked -p <crate>），确认零报错后再结束；"
+              echo "5. 严禁修改或新增 .github/workflows/ 下的工作流文件；"
+              echo "6. 用清晰的中文简要说明本轮发现的问题根因及修复方案。"
+            } > /tmp/agy_heal_prompt.txt
+
+            invoke_agy_with_prompt "$(cat /tmp/agy_heal_prompt.txt)"
+            clean_extra_workflows
+
+            # 将 AI 自愈产生的工作区改动提交到本地分支
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              git add -u
+              if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
+                git commit -m "fix(sync): auto-heal compile/clippy/test regressions (round ${REPAIR_ROUND})"
+              else
                 git commit --amend --no-edit
-              fi
-              SUMMARY=$(printf '%s\n\n**测试修复补充**：\n%s' "${PREV_SUMMARY}" "${SUMMARY}")
-
-              if ! bash .github/workflows/verify-fork-driver.sh; then
-                cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY" || true
-                notify_failure "冲突合并后经 agy 二次修复仍未通过双向编译与回归测试。"
-                exit 1
               fi
             fi
 
-            PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并解决冲突"
-            PR_INTRO="上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`，合并到 \`${TARGET_BRANCH}\` 时出现以下文件冲突，已由 **Antigravity CLI (\`agy\`)** 自动解决并通过全部双向测试："
+            if [[ -n "${AI_LOG_SECTIONS}" ]]; then
+              AI_LOG_SECTIONS="${AI_LOG_SECTIONS}"$'\n\n'"#### 自动编译/测试自愈（第 ${REPAIR_ROUND} 轮）"$'\n'"${SUMMARY}"
+            else
+              AI_LOG_SECTIONS="#### 自动编译/测试自愈（第 ${REPAIR_ROUND} 轮）"$'\n'"${SUMMARY}"
+            fi
+          done
+
+          if [[ -f /tmp/verify_report.md ]]; then
+            cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY"
+          if [[ "${VERIFIED_OK}" != "true" ]]; then
+            FINAL_SHA=$(git rev-parse HEAD)
+            if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
+              post_commit_status "${FINAL_SHA}" "failure" "Auto-heal exhausted ${MAX_REPAIR_ROUNDS} rounds; manual inspection required"
+            fi
+            notify_failure "经过 ${MAX_REPAIR_ROUNDS} 轮 AI 自动修复后，5 层双向编译与回归测试仍未完全通过。"
+            exit 1
+          fi
+
+          # ====================================================================
+          # 阶段 3：全部 5 层测试 100% 通过！按状态自动发布 / 更新 PR / 合入
+          # ====================================================================
           FINAL_SHA=$(git rev-parse HEAD)
 
-          # 根据开关决定直接合入目标分支，还是在本仓库创建附带绿色测试报告的 PR
+          # 情况 1：修复了已存在的待审 PR（如之前未通过测试的 auto-sync PR）
+          if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
+            git push origin "HEAD:refs/heads/${EXISTING_PR_REF}"
+            post_commit_status "${FINAL_SHA}" "success" "Auto-healed (${REPAIR_ROUND} round(s)) & all 5 test layers passed"
+            upsert_pr_verify_comment "${EXISTING_PR_NUM}" "${AI_LOG_SECTIONS}"
+            close_stale_alert_issues "自动修复并验证通过现有 PR #${EXISTING_PR_NUM}：${EXISTING_PR_URL}"
+            echo "Successfully healed and verified existing PR #${EXISTING_PR_NUM} (${EXISTING_PR_URL})!"
+            exit 0
+          fi
+
+          # 情况 2：Git 无文本冲突 且 第 0 轮一次全绿（零 AI 代码改动）—— 直接安全推入主分支
+          if [[ "${MERGE_STATUS}" == "merged_cleanly" && "${REPAIR_ROUND}" -eq 0 ]]; then
+            git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            post_commit_status "${FINAL_SHA}" "success" "Clean merge verified: all 5 compile, unit, Wayland & GTK3 AT-SPI layers passed"
+            close_stale_alert_issues "已无冲突合入 \`${TARGET_BRANCH}\` 并一次通过全部 5 层测试"
+            echo "Clean merge passed all 5 layers on first run and was pushed to ${TARGET_BRANCH}!"
+            exit 0
+          fi
+
+          # 情况 3：存在 Git 冲突，或虽无 Git 冲突但触发了“语义/编译/测试自愈”（产生了 AI 适配代码）
+          if [[ "${MERGE_STATUS}" == "merged_cleanly" ]]; then
+            PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并自动修复编译/测试兼容问题"
+            PR_INTRO="上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHA}\` 在 Git 文本层面无冲突，但 **5 层双向测试拦截到了跨侧编译/Clippy/功能兼容问题**，已由 **Antigravity CLI (\`agy\`)** 自动完成自愈修复并通过全部测试："
+          else
+            PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并自动解决冲突与测试验证"
+            PR_INTRO="上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHA}\` 合并到 \`${TARGET_BRANCH}\` 时出现冲突，已由 **Antigravity CLI (\`agy\`)** 自动完成代码融合并通过全部 5 层双向回归测试："
+          fi
+
           RESULT_REF=""
           if [[ "${AUTO_MERGE_INPUT}" == "true" || "${AUTO_MERGE_VAR}" == "true" ]]; then
             git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
-            post_commit_status "${FINAL_SHA}" "success" "5-layer bidirectional compile, clippy, unit, Wayland & GTK3 AT-SPI passed"
+            post_commit_status "${FINAL_SHA}" "success" "All 5 layers passed after automated conflict/test resolution"
             echo "Auto-merged verified changes directly into ${TARGET_BRANCH}!"
-            RESULT_REF="已直接自动合并至 \`${TARGET_BRANCH}\`"
+            RESULT_REF="已通过全部 5 层测试并直接自动合并至 \`${TARGET_BRANCH}\`"
           else
             PR_BRANCH="auto-sync/${UPSTREAM_SHORT}-$(date -u +%Y%m%d-%H%M)"
             git push -u origin "HEAD:refs/heads/${PR_BRANCH}"
-            post_commit_status "${FINAL_SHA}" "success" "5-layer bidirectional compile, clippy, unit, Wayland & GTK3 AT-SPI passed"
+            post_commit_status "${FINAL_SHA}" "success" "All 5 layers passed (fmt + clippy + unit + Wayland portal + GTK3 AT-SPI)"
 
             {
-              echo "## 🤖 自动同步修复与验证报告"
+              echo "## 🤖 自动同步、自愈修复与双向回归测试报告"
               echo ""
               echo "${PR_INTRO}"
               if [[ -n "${CONFLICT_FILES:-}" ]]; then
                 echo ""
-                echo "### 冲突文件列表"
+                echo "### Git 冲突文件列表"
                 echo "\`\`\`"
                 echo "${CONFLICT_FILES}"
                 echo "\`\`\`"
               fi
               echo ""
-              echo "### AI 融合与适配说明"
-              printf '%s\n' "${SUMMARY}"
+              echo "### AI 融合与自愈说明"
+              printf '%s\n' "${AI_LOG_SECTIONS}"
               echo ""
               cat /tmp/verify_report.md
               echo ""
               echo "---"
-              echo "> 确认代码改动与上方测试结果无误后，直接点击下方 **Merge pull request** 即可合入 \`${TARGET_BRANCH}\`。"
-              echo "> *(后续若希望测试全绿时跳过人工确认直接合入，可将仓库 \`Settings -> Secrets and variables -> Actions -> Variables\` 中的 \`AUTO_MERGE_CONFLICTS\` 改为 \`true\`。)*"
+              echo "> 上方 5 层双向编译与回归测试已 **100% 通过 ✅**，确认代码改动无误后点击 **Merge pull request** 即可合入 \`${TARGET_BRANCH}\`。"
+              echo "> *(若后续希望在 5 层测试全绿时跳过人工确认直接合入，可将仓库 Variables 中的 \`AUTO_MERGE_CONFLICTS\` 设为 \`true\`。)*"
             } > /tmp/pr_body.md
 
             PR_URL=$(jq -n \
@@ -683,7 +768,7 @@ jobs:
               '{title: $title, head: $head, base: $base, body: $body}' \
               | gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" --input - --jq '.html_url')
             echo "Created verified sync PR: ${PR_URL}"
-            RESULT_REF="已自动创建并通过测试的 PR：${PR_URL}"
+            RESULT_REF="已创建通过全部 5 层测试的同步 PR：${PR_URL}"
           fi
 
           close_stale_alert_issues "${RESULT_REF}"
@@ -823,7 +908,7 @@ jobs:
                 echo "<details><summary>展开查看错误日志摘要</summary>"
                 echo ""
                 echo "\`\`\`text"
-                tail -n 100 /tmp/verify_failure.log
+                head -n 140 /tmp/verify_failure.log
                 echo "\`\`\`"
                 echo "</details>"
               fi

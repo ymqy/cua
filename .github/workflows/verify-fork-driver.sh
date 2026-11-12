@@ -61,7 +61,11 @@ run_layer() {
     LAYER_ROWS+=("| ❌ 失败 | **${layer_id}. ${layer_title}** | ${layer_scope} | ${elapsed}s |")
     {
       echo "Failed layer: [${layer_id}] ${layer_title} (exit ${rc})"
-      echo "--------------------------------------------------------------------------------"
+      echo "Full raw log path: ${RAW_LOG}"
+      echo "==== Key Error / Panic / Diff Blocks ===="
+      grep -n -C 10 -E '^(error(\[|:)|FAILED|thread .* panicked|Diff in )' "${RAW_LOG}" | head -n 260 || true
+      echo ""
+      echo "==== Raw Log Tail (last 160 lines) ===="
       tail -n 160 "${RAW_LOG}"
     } > "${FAILURE_LOG}"
     write_report "FAILED" "${layer_id}. ${layer_title}"
