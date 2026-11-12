@@ -113,10 +113,12 @@ jobs:
             echo "${UNMERGED}"
           fi
 
-      - name: Install agy, resolve conflicts, and notify or merge
+      - name: Install agy, resolve conflicts via Vertex AI, and notify or merge
         if: steps.merge_attempt.outputs.status == 'conflict'
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
+          VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGY_CLI_DISABLE_AUTO_UPDATE: "true"
           AUTO_MERGE_INPUT: ${{ inputs.auto_merge_conflict_resolution }}
@@ -127,18 +129,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          VERTEX_PROXY_PID=""
+          cleanup() {
+            if [[ -n "${VERTEX_PROXY_PID}" ]]; then
+              kill "${VERTEX_PROXY_PID}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
           notify_failure() {
             local reason="$1"
             local title="⚠️ 自动同步冲突需人工检查 (${UPSTREAM_SHORT})"
-
-            # 避免同一提交重复创建告警 Issue
-            local existing_issue
-            existing_issue=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
-              --jq ".[] | select(.title == \"${title}\") | .html_url" | head -n 1 || true)
-            if [[ -n "${existing_issue}" ]]; then
-              echo "Open alert issue already exists: ${existing_issue}"
-              return 0
-            fi
 
             {
               echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 合并到 \`${TARGET_BRANCH}\` 时检测到代码冲突，且自动修复未完成。"
@@ -156,6 +157,17 @@ jobs:
               echo "**运行日志**：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             } > /tmp/sync_issue_body.md
 
+            # 若同一提交已有打开的告警 Issue，则追加最新失败原因评论，避免重复建单
+            local existing_num
+            existing_num=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
+              --jq ".[] | select(.title == \"${title}\") | .number" | head -n 1 || true)
+            if [[ -n "${existing_num}" ]]; then
+              jq -n --rawfile body /tmp/sync_issue_body.md '{body: $body}' \
+                | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${existing_num}/comments" --input - >/dev/null || true
+              echo "Updated existing alert issue #${existing_num}."
+              return 0
+            fi
+
             jq -n \
               --arg title "${title}" \
               --rawfile body /tmp/sync_issue_body.md \
@@ -163,9 +175,9 @@ jobs:
               | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" --input - >/dev/null || true
           }
 
-          if [[ -z "${GEMINI_API_KEY:-}" ]]; then
-            notify_failure "未配置 GEMINI_API_KEY Secret，请前往 Settings -> Secrets and variables -> Actions 添加。"
-            echo "Error: GEMINI_API_KEY secret is not configured." >&2
+          if [[ -z "${VERTEX_API_KEY:-}" ]]; then
+            notify_failure "未配置 VERTEX_API_KEY Secret，请前往 Settings -> Secrets and variables -> Actions 添加。"
+            echo "Error: VERTEX_API_KEY secret is not configured." >&2
             exit 1
           fi
 
@@ -182,7 +194,170 @@ jobs:
           fi
           echo "Installed Antigravity CLI version: $(agy --version)"
 
-          # 2. 配置 Gemini API Key 直连模式并信任当前工作目录
+          # 2. 启动本地 Vertex AI 路由桥接（将 agy 的 /v1beta/models/* 转发至 aiplatform.googleapis.com）
+          cat <<'PY' > /tmp/vertex_proxy.py
+          #!/usr/bin/env python3
+          import http.server
+          import json
+          import os
+          import re
+          import sys
+          import threading
+          import urllib.error
+          import urllib.request
+
+          API_KEY = os.environ["VERTEX_API_KEY"]
+          EXPLICIT_PROJECT = os.environ.get("VERTEX_PROJECT_ID", "").strip()
+          EXPLICIT_LOCATION = os.environ.get("VERTEX_LOCATION", "").strip() or "global"
+
+          _lock = threading.Lock()
+          _discovered_project = ""
+
+          PATH_RE = re.compile(r"^/v1(?:beta1?)?/models/([^/:?]+):([^?]+)(?:\?(.*))?$")
+          PROJ_ERR_RE = re.compile(r"projects/([^/`\"'\s]+)/locations/")
+
+
+          def build_vertex_url(model: str, action: str, query: str, project: str, location: str) -> str:
+              if project and location and location != "global":
+                  base = f"https://{location}-aiplatform.googleapis.com"
+              else:
+                  base = "https://aiplatform.googleapis.com"
+
+              if project:
+                  loc = location or "global"
+                  path = f"/v1beta1/projects/{project}/locations/{loc}/publishers/google/models/{model}:{action}"
+              else:
+                  path = f"/v1beta1/publishers/google/models/{model}:{action}"
+
+              return f"{base}{path}?{query}" if query else f"{base}{path}"
+
+
+          def strip_legacy_thinking_budget(raw_body: bytes):
+              try:
+                  payload = json.loads(raw_body)
+              except Exception:
+                  return None
+              gen_cfg = payload.get("generationConfig")
+              if not isinstance(gen_cfg, dict):
+                  return None
+              think_cfg = gen_cfg.get("thinkingConfig")
+              if not isinstance(think_cfg, dict) or "thinkingBudget" not in think_cfg:
+                  return None
+              budget = think_cfg.pop("thinkingBudget", -1)
+              if "thinkingLevel" not in think_cfg:
+                  think_cfg["thinkingLevel"] = "HIGH" if (budget < 0 or budget >= 4096) else "LOW"
+              return json.dumps(payload).encode("utf-8")
+
+
+          class VertexBridgeHandler(http.server.BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def log_message(self, fmt, *args):
+                  pass
+
+              def _send_error_json(self, code: int, body: bytes):
+                  self.send_response(code)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.close_connection = True
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_POST(self):
+                  global _discovered_project
+                  m = PATH_RE.match(self.path)
+                  if not m:
+                      msg = json.dumps({"error": {"code": 404, "message": f"Unsupported path: {self.path}"}}).encode()
+                      self._send_error_json(404, msg)
+                      return
+
+                  model, action, query = m.group(1), m.group(2), m.group(3) or ""
+                  length = int(self.headers.get("Content-Length", 0))
+                  body = self.rfile.read(length)
+
+                  with _lock:
+                      project = EXPLICIT_PROJECT or _discovered_project
+                  location = EXPLICIT_LOCATION if EXPLICIT_PROJECT else "global"
+
+                  headers = {
+                      "Content-Type": self.headers.get("Content-Type", "application/json"),
+                      "x-goog-api-key": API_KEY,
+                  }
+                  if "Accept" in self.headers:
+                      headers["Accept"] = self.headers["Accept"]
+
+                  for _attempt in range(3):
+                      url = build_vertex_url(model, action, query, project, location)
+                      req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                      try:
+                          with urllib.request.urlopen(req, timeout=300) as resp:
+                              self.send_response(resp.status)
+                              ctype = resp.headers.get("Content-Type", "application/json")
+                              self.send_header("Content-Type", ctype)
+                              self.close_connection = True
+                              self.end_headers()
+                              while True:
+                                  chunk = resp.read1(4096) if hasattr(resp, "read1") else resp.read(4096)
+                                  if not chunk:
+                                      break
+                                  self.wfile.write(chunk)
+                                  self.wfile.flush()
+                              return
+                      except urllib.error.HTTPError as e:
+                          err_body = e.read()
+                          err_text = err_body.decode("utf-8", "replace")
+                          if e.code == 404 and not project:
+                              pm = PROJ_ERR_RE.search(err_text)
+                              if pm:
+                                  project = pm.group(1)
+                                  location = "global"
+                                  with _lock:
+                                      _discovered_project = project
+                                  continue
+                          if e.code == 400 and ("thinking_budget" in err_text or "thinkingBudget" in err_text):
+                              patched = strip_legacy_thinking_budget(body)
+                              if patched is not None:
+                                  body = patched
+                                  continue
+                          self._send_error_json(e.code, err_body)
+                          return
+                      except Exception as e:
+                          msg = json.dumps({"error": {"code": 502, "message": f"Vertex proxy upstream error: {e}"}}).encode()
+                          self._send_error_json(502, msg)
+                          return
+
+
+          def main():
+              port_file = sys.argv[1]
+              srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), VertexBridgeHandler)
+              tmp_file = f"{port_file}.tmp"
+              with open(tmp_file, "w") as f:
+                  f.write(str(srv.server_address[1]))
+              os.replace(tmp_file, port_file)
+              srv.serve_forever()
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+          rm -f /tmp/vertex_proxy.port
+          python3 /tmp/vertex_proxy.py /tmp/vertex_proxy.port &
+          VERTEX_PROXY_PID=$!
+          for _ in {1..50}; do
+            if [[ -s /tmp/vertex_proxy.port ]]; then
+              break
+            fi
+            sleep 0.1
+          done
+          if [[ ! -s /tmp/vertex_proxy.port ]]; then
+            notify_failure "启动本地 Vertex AI 路由代理失败。"
+            exit 1
+          fi
+          VERTEX_PROXY_PORT=$(cat /tmp/vertex_proxy.port)
+          echo "Vertex AI local bridge listening on 127.0.0.1:${VERTEX_PROXY_PORT} -> aiplatform.googleapis.com"
+
+          # 配置 agy 通过本地桥接访问 Vertex AI，并信任当前工作目录
           mkdir -p "$HOME/.gemini/antigravity-cli"
           jq -n \
             --arg ws "${GITHUB_WORKSPACE}" \
@@ -203,6 +378,10 @@ jobs:
           PROMPT=$(cat /tmp/agy_prompt.txt)
 
           run_agy() {
+            GEMINI_API_KEY="${VERTEX_API_KEY}" \
+            GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${VERTEX_PROXY_PORT}" \
+            NO_PROXY="127.0.0.1,localhost" \
+            no_proxy="127.0.0.1,localhost" \
             agy -p "$PROMPT" \
               --settings '{"modelProvider":"gemini"}' \
               --dangerously-skip-permissions \
