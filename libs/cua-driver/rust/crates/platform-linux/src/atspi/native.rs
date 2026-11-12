@@ -3857,9 +3857,7 @@ async fn fire_menu_node(target: &Visited<'_>, depth: usize) -> Result<bool> {
     }
     let chosen = activation_index(&target.role, &target.actions)
         .or_else(|| {
-            if target.role.to_ascii_lowercase().contains("button")
-                && !target.actions.is_empty()
-            {
+            if target.role.to_ascii_lowercase().contains("button") && !target.actions.is_empty() {
                 Some(0)
             } else {
                 None
