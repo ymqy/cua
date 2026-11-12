@@ -4,32 +4,49 @@ on:
   schedule:
     # 每 6 小时自动检查并同步一次上游最新提交（避开整点队列高峰）
     - cron: '17 */6 * * *'
+  pull_request:
+    branches:
+      - feat/wayland-with-perception-opt
   workflow_dispatch:
     inputs:
       auto_merge_conflict_resolution:
-        description: '遇到代码冲突并由 agy 修复后，是否直接合入目标分支（默认 false：提 PR 发通知确认）'
+        description: '遇到冲突或语义适配并由 agy 修复通过测试后，是否直接合入目标分支（默认 false：提 PR 确认）'
         required: false
         default: false
         type: boolean
+      verify_ref:
+        description: '仅针对指定分支或 Commit SHA 运行双向编译与回归测试（留空则执行正常上游同步）'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
-  group: sync-upstream-main
-  cancel-in-progress: false
+  group: sync-upstream-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (inputs.verify_ref != '' && format('verify-{0}', inputs.verify_ref)) || 'sync' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: write
   pull-requests: write
   issues: write
+  statuses: write
 
 env:
   UPSTREAM_REPO: trycua/cua
   TARGET_BRANCH: feat/wayland-with-perception-opt
+  VERIFY_STATUS_CONTEXT: verify/driver-wayland-perception
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CUA_TELEMETRY: "0"
+  DO_NOT_TRACK: "1"
 
 jobs:
   sync:
     name: Sync upstream/main into feat/wayland-with-perception-opt
+    if: github.event_name != 'pull_request' && inputs.verify_ref == ''
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
 
     steps:
       - name: Checkout fork repository
@@ -38,7 +55,7 @@ jobs:
           ref: feat/wayland-with-perception-opt
           fetch-depth: 0
 
-      - name: Fetch upstream and attempt clean merge
+      - name: Fetch upstream and attempt merge
         id: merge_attempt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -63,7 +80,7 @@ jobs:
           echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
           echo "upstream_short=${UPSTREAM_SHORT}" >> "$GITHUB_OUTPUT"
 
-          # 2. 检查目标分支是否已包含最新 upstream/main
+          # 2. 检查目标分支是否已包含最新 upstream/main（无更新时 ~5s 极速退出，不装依赖）
           git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
           if git merge-base --is-ancestor upstream/main HEAD; then
             echo "status=up_to_date" >> "$GITHUB_OUTPUT"
@@ -71,7 +88,7 @@ jobs:
             exit 0
           fi
 
-          # 3. 检查本仓库（显式指定 repos/${GITHUB_REPOSITORY}，绝不访问上游）是否已有针对该 commit 的待合并 PR
+          # 3. 检查本仓库是否已有针对该上游 commit 的待合并 PR
           EXISTING_PR=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${TARGET_BRANCH}&per_page=50" \
             --jq ".[] | select(.head.ref | startswith(\"auto-sync/${UPSTREAM_SHORT}\")) | .html_url" \
             | head -n 1 || true)
@@ -81,12 +98,12 @@ jobs:
             exit 0
           fi
 
-          # 4. 尝试将 upstream/main 合并进目标分支（先不提交，自动剥离上游自带的 workflows）
+          # 4. 尝试将 upstream/main 合并进目标分支（先不推送，必须经过双向测试验证后再推送）
           git merge --no-commit --no-ff upstream/main || true
 
-          # 自动移除因上游修改/新增 .github/workflows/*.yml 产生的文件或删改冲突，始终只保留 sync-upstream.yml
+          # 自动移除因上游修改/新增 .github/workflows/*.yml 产生的文件或删改冲突，始终保留 sync-upstream.yml 与 verify-fork-driver.sh
           while IFS= read -r wf; do
-            if [[ -n "$wf" && "$wf" != ".github/workflows/sync-upstream.yml" ]]; then
+            if [[ -n "$wf" && "$wf" != ".github/workflows/sync-upstream.yml" && "$wf" != ".github/workflows/verify-fork-driver.sh" ]]; then
               git rm -f --ignore-unmatch -- "$wf"
             fi
           done < <(git diff --name-only --diff-filter=U -- '.github/workflows/')
@@ -95,13 +112,12 @@ jobs:
             ! -path '.github/workflows/sync-upstream.yml' \
             -exec git rm -f --ignore-unmatch -- {} +
 
-          # 5. 检查是否还剩余真正的代码冲突
+          # 5. 检查是否剩余代码文本冲突（即使无文本冲突也只本地 commit，待测试通过后再 push）
           UNMERGED=$(git diff --name-only --diff-filter=U || true)
           if [[ -z "${UNMERGED}" ]]; then
             git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
-            git push origin "${TARGET_BRANCH}"
             echo "status=merged_cleanly" >> "$GITHUB_OUTPUT"
-            echo "Cleanly merged ${UPSTREAM_SHORT} into ${TARGET_BRANCH}."
+            echo "Cleanly merged ${UPSTREAM_SHORT} locally; proceeding to bidirectional test verification before push."
           else
             echo "status=conflict" >> "$GITHUB_OUTPUT"
             {
@@ -113,8 +129,43 @@ jobs:
             echo "${UNMERGED}"
           fi
 
-      - name: Install agy, resolve conflicts via Vertex AI, and notify or merge
-        if: steps.merge_attempt.outputs.status == 'conflict'
+      - name: Free runner disk space
+        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        uses: ./.github/actions/linux-rust-prep
+        with:
+          install-deps: "false"
+
+      - name: Install pinned Rust toolchain with rustfmt and clippy
+        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        run: |
+          set -euo pipefail
+          TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' libs/cua-driver/rust/rust-toolchain.toml)
+          TOOLCHAIN="${TOOLCHAIN:-stable}"
+          echo "Installing Rust toolchain ${TOOLCHAIN} (rustfmt + clippy)..."
+          rustup toolchain install "${TOOLCHAIN}" --profile minimal --component rustfmt --component clippy
+
+      - name: Configure Rust sccache
+        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        uses: ./.github/actions/rust-cache
+        with:
+          workspaces: "libs/cua-driver/rust -> target"
+          pr-save: "true"
+
+      - name: Install Linux build and headless desktop dependencies
+        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            build-essential cmake clang pkg-config
+            libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev libei-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libudev-dev
+            libx11-dev libx11-xcb-dev libxcb1-dev libxext-dev libxi-dev
+            libxtst-dev libxrandr-dev libgtk-3-dev
+            xvfb xauth x11-utils xdotool dbus-daemon dbus-x11 at-spi2-core
+            openbox picom python3-gi gir1.2-gtk-3.0 imagemagick ffmpeg
+
+      - name: Resolve conflicts, run bidirectional verification, and publish
+        if: steps.merge_attempt.outputs.status == 'merged_cleanly' || steps.merge_attempt.outputs.status == 'conflict'
         env:
           VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
           VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
@@ -123,13 +174,18 @@ jobs:
           AGY_CLI_DISABLE_AUTO_UPDATE: "true"
           AUTO_MERGE_INPUT: ${{ inputs.auto_merge_conflict_resolution }}
           AUTO_MERGE_VAR: ${{ vars.AUTO_MERGE_CONFLICTS }}
+          MERGE_STATUS: ${{ steps.merge_attempt.outputs.status }}
           UPSTREAM_SHORT: ${{ steps.merge_attempt.outputs.upstream_short }}
           UPSTREAM_SHA: ${{ steps.merge_attempt.outputs.upstream_sha }}
           CONFLICT_FILES: ${{ steps.merge_attempt.outputs.conflict_files }}
         run: |
           set -euo pipefail
 
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           VERTEX_PROXY_PID=""
+          VERTEX_PROXY_PORT=""
+          SUMMARY=""
+
           cleanup() {
             if [[ -n "${VERTEX_PROXY_PID}" ]]; then
               kill "${VERTEX_PROXY_PID}" 2>/dev/null || true
@@ -137,27 +193,62 @@ jobs:
           }
           trap cleanup EXIT
 
+          post_commit_status() {
+            local sha="$1"
+            local state="$2"
+            local desc="$3"
+            jq -n \
+              --arg state "${state}" \
+              --arg target_url "${RUN_URL}" \
+              --arg description "${desc:0:138}" \
+              --arg context "${VERIFY_STATUS_CONTEXT}" \
+              '{state: $state, target_url: $target_url, description: $description, context: $context}' \
+              | gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${sha}" --input - >/dev/null || true
+          }
+
+          close_stale_alert_issues() {
+            local msg="$1"
+            gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
+              --jq '.[] | select(.title | startswith("⚠️ 自动同步")) | .number' \
+              | while IFS= read -r inum; do
+                  if [[ -n "$inum" ]]; then
+                    jq -n --arg body "✅ 最新同步运行已完成处理且通过全部双向测试（${msg}），自动关闭此告警。" '{body: $body}' \
+                      | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${inum}/comments" --input - >/dev/null || true
+                    printf '{"state":"closed"}' \
+                      | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${inum}" --input - >/dev/null || true
+                  fi
+                done || true
+          }
+
           notify_failure() {
             local reason="$1"
-            local title="⚠️ 自动同步冲突需人工检查 (${UPSTREAM_SHORT})"
+            local title="⚠️ 自动同步冲突或测试未通过需人工检查 (${UPSTREAM_SHORT})"
 
             {
-              echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 合并到 \`${TARGET_BRANCH}\` 时检测到代码冲突，且自动修复未完成。"
+              echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 合并到 \`${TARGET_BRANCH}\` 时未能通过自动冲突修复或双向回归测试，**未向目标分支推送未验证代码**。"
               echo ""
-              echo "**原因**："
+              echo "**失败原因**："
               echo "\`\`\`"
               printf '%s\n' "${reason}"
               echo "\`\`\`"
+              if [[ -n "${CONFLICT_FILES:-}" ]]; then
+                echo ""
+                echo "**冲突文件**："
+                echo "\`\`\`"
+                printf '%s\n' "${CONFLICT_FILES}"
+                echo "\`\`\`"
+              fi
+              if [[ -s /tmp/verify_failure.log ]]; then
+                echo ""
+                echo "**编译 / 测试错误日志摘要**："
+                echo "\`\`\`text"
+                tail -n 100 /tmp/verify_failure.log
+                echo "\`\`\`"
+              fi
               echo ""
-              echo "**冲突文件**："
-              echo "\`\`\`"
-              printf '%s\n' "${CONFLICT_FILES}"
-              echo "\`\`\`"
-              echo ""
-              echo "**运行日志**：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+              echo "**完整运行日志**：${RUN_URL}"
             } > /tmp/sync_issue_body.md
 
-            # 若同一提交已有打开的告警 Issue，则追加最新失败原因评论，避免重复建单
             local existing_num
             existing_num=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
               --jq ".[] | select(.title == \"${title}\") | .number" | head -n 1 || true)
@@ -175,27 +266,31 @@ jobs:
               | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" --input - >/dev/null || true
           }
 
-          if [[ -z "${VERTEX_API_KEY:-}" ]]; then
-            notify_failure "未配置 VERTEX_API_KEY Secret，请前往 Settings -> Secrets and variables -> Actions 添加。"
-            echo "Error: VERTEX_API_KEY secret is not configured." >&2
-            exit 1
-          fi
+          ensure_agy_and_vertex_bridge() {
+            if [[ -n "${VERTEX_PROXY_PORT}" ]]; then
+              return 0
+            fi
 
-          # 1. 安装官方 Antigravity CLI 到 ~/.local/bin/agy
-          mkdir -p "$HOME/.local/bin"
-          if ! curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d "$HOME/.local/bin"; then
-            notify_failure "下载或安装 Antigravity CLI (install.sh) 失败。"
-            exit 1
-          fi
-          export PATH="$HOME/.local/bin:$PATH"
-          if ! command -v agy >/dev/null 2>&1; then
-            notify_failure "安装完成后未在 PATH 中找到 agy 可执行文件。"
-            exit 1
-          fi
-          echo "Installed Antigravity CLI version: $(agy --version)"
+            if [[ -z "${VERTEX_API_KEY:-}" ]]; then
+              notify_failure "未配置 VERTEX_API_KEY Secret，无法调用 agy 自动修复冲突或语义破坏。"
+              exit 1
+            fi
 
-          # 2. 启动本地 Vertex AI 路由桥接（将 agy 的 /v1beta/models/* 转发至 aiplatform.googleapis.com）
-          cat <<'PY' > /tmp/vertex_proxy.py
+            mkdir -p "$HOME/.local/bin"
+            if ! command -v agy >/dev/null 2>&1; then
+              if ! curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- -d "$HOME/.local/bin"; then
+                notify_failure "下载或安装 Antigravity CLI (install.sh) 失败。"
+                exit 1
+              fi
+              export PATH="$HOME/.local/bin:$PATH"
+            fi
+            if ! command -v agy >/dev/null 2>&1; then
+              notify_failure "安装完成后未在 PATH 中找到 agy 可执行文件。"
+              exit 1
+            fi
+            echo "Installed Antigravity CLI version: $(agy --version)"
+
+            cat <<'PY' > /tmp/vertex_proxy.py
           #!/usr/bin/env python3
           import http.server
           import json
@@ -341,166 +436,410 @@ jobs:
               main()
           PY
 
-          rm -f /tmp/vertex_proxy.port
-          python3 /tmp/vertex_proxy.py /tmp/vertex_proxy.port &
-          VERTEX_PROXY_PID=$!
-          for _ in {1..50}; do
-            if [[ -s /tmp/vertex_proxy.port ]]; then
-              break
+            rm -f /tmp/vertex_proxy.port
+            python3 /tmp/vertex_proxy.py /tmp/vertex_proxy.port &
+            VERTEX_PROXY_PID=$!
+            for _ in {1..50}; do
+              if [[ -s /tmp/vertex_proxy.port ]]; then
+                break
+              fi
+              sleep 0.1
+            done
+            if [[ ! -s /tmp/vertex_proxy.port ]]; then
+              notify_failure "启动本地 Vertex AI 路由代理失败。"
+              exit 1
             fi
-            sleep 0.1
-          done
-          if [[ ! -s /tmp/vertex_proxy.port ]]; then
-            notify_failure "启动本地 Vertex AI 路由代理失败。"
-            exit 1
-          fi
-          VERTEX_PROXY_PORT=$(cat /tmp/vertex_proxy.port)
-          echo "Vertex AI local bridge listening on 127.0.0.1:${VERTEX_PROXY_PORT} -> aiplatform.googleapis.com"
+            VERTEX_PROXY_PORT=$(cat /tmp/vertex_proxy.port)
+            echo "Vertex AI local bridge listening on 127.0.0.1:${VERTEX_PROXY_PORT} -> aiplatform.googleapis.com"
 
-          # 配置 agy 通过本地桥接访问 Vertex AI，并信任当前工作目录
-          mkdir -p "$HOME/.gemini/antigravity-cli"
-          jq -n \
-            --arg ws "${GITHUB_WORKSPACE}" \
-            '{modelProvider: "gemini", trustedWorkspaces: [$ws]}' \
-            > "$HOME/.gemini/antigravity-cli/settings.json"
-
-          # 3. 调用 agy 无头模式分析并解决冲突
-          {
-            echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。"
-            echo "请严格按以下步骤操作："
-            echo "1. 运行 git status 查看所有处于未合并冲突状态（UU/AA/DU/UD）的文件；"
-            echo "2. 阅读冲突文件的完整上下文，并通过 git log MERGE_HEAD -n 15 -- <冲突文件> 查看官方最新改动意图，同时通过 git log HEAD -n 15 -- <冲突文件> 查看本分支（Linux Wayland 与感知优化）的定制改动意图，谨慎融合双方逻辑，确保语法、类型、括号闭合、函数签名和导入完全正确；"
-            echo "3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何工作流文件；"
-            echo "4. 运行 git diff --check 确保没有任何残留冲突标记（<<<<<<<、=======、>>>>>>>）；"
-            echo "5. 使用 git add 暂存已解决的冲突文件，并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\" 完成合并提交；"
-            echo "6. 用清晰的中文逐个文件简要说明冲突原因以及你的融合解决方式（这段说明将直接写入 PR 描述供仓库维护者审阅）。"
-          } > /tmp/agy_prompt.txt
-          PROMPT=$(cat /tmp/agy_prompt.txt)
-
-          run_agy() {
-            GEMINI_API_KEY="${VERTEX_API_KEY}" \
-            GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${VERTEX_PROXY_PORT}" \
-            NO_PROXY="127.0.0.1,localhost" \
-            no_proxy="127.0.0.1,localhost" \
-            agy -p "$PROMPT" \
-              --settings '{"modelProvider":"gemini"}' \
-              --dangerously-skip-permissions \
-              --output-format json \
-              --print-timeout 20m \
-              "$@" >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
+            mkdir -p "$HOME/.gemini/antigravity-cli"
+            jq -n \
+              --arg ws "${GITHUB_WORKSPACE}" \
+              '{modelProvider: "gemini", trustedWorkspaces: [$ws]}' \
+              > "$HOME/.gemini/antigravity-cli/settings.json"
           }
 
-          set +e
-          run_agy --effort high
-          AGY_EXIT=$?
-          if [[ $AGY_EXIT -ne 0 ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|model' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
-            echo "Default model returned access/quota error; retrying with gemini-3.8-flash-high..."
-            run_agy --model gemini-3.8-flash-high
-            AGY_EXIT=$?
-          fi
-          set -e
+          invoke_agy_with_prompt() {
+            local prompt_text="$1"
+            ensure_agy_and_vertex_bridge
 
-          if [[ $AGY_EXIT -ne 0 ]]; then
-            ERR_MSG=$(jq -r '.error // empty' /tmp/agy_stdout.json 2>/dev/null || true)
-            if [[ -z "${ERR_MSG}" ]]; then
-              ERR_MSG=$(tail -n 20 /tmp/agy_stderr.log 2>/dev/null || echo "exit code ${AGY_EXIT}")
+            run_once() {
+              GEMINI_API_KEY="${VERTEX_API_KEY}" \
+              GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${VERTEX_PROXY_PORT}" \
+              NO_PROXY="127.0.0.1,localhost" \
+              no_proxy="127.0.0.1,localhost" \
+              agy -p "${prompt_text}" \
+                --settings '{"modelProvider":"gemini"}' \
+                --dangerously-skip-permissions \
+                --output-format json \
+                --print-timeout 20m \
+                "$@" >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
+            }
+
+            set +e
+            run_once --effort high
+            local agy_rc=$?
+            if [[ $agy_rc -ne 0 ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|model' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
+              echo "Default model returned access/quota error; retrying with gemini-3.8-flash-high..."
+              run_once --model gemini-3.8-flash-high
+              agy_rc=$?
             fi
-            cat /tmp/agy_stderr.log >&2 || true
-            notify_failure "agy 执行返回非零状态（exit ${AGY_EXIT}）：${ERR_MSG}"
-            exit 1
-          fi
+            set -e
 
-          STATUS=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json)
-          SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
-
-          if [[ "$STATUS" != "SUCCESS" ]]; then
-            ERR_MSG=$(jq -r '.error // "unknown error"' /tmp/agy_stdout.json)
-            notify_failure "agy 返回状态 ${STATUS}：${ERR_MSG}"
-            exit 1
-          fi
-
-          # 4. 兜底复核：检查冲突文件是否仍有冲突标记、剥离上游 workflows、必要时补交合并提交
-          MARKER_FOUND=""
-          while IFS= read -r cf; do
-            if [[ -n "$cf" && -f "$cf" ]] && grep -nE '^(<<<<<<< |=======$|>>>>>>> )' -- "$cf" >/dev/null 2>&1; then
-              MARKER_FOUND="${MARKER_FOUND}${cf} "
+            if [[ $agy_rc -ne 0 ]]; then
+              local err_msg
+              err_msg=$(jq -r '.error // empty' /tmp/agy_stdout.json 2>/dev/null || true)
+              if [[ -z "${err_msg}" ]]; then
+                err_msg=$(tail -n 20 /tmp/agy_stderr.log 2>/dev/null || echo "exit code ${agy_rc}")
+              fi
+              cat /tmp/agy_stderr.log >&2 || true
+              notify_failure "agy 执行返回非零状态（exit ${agy_rc}）：${err_msg}"
+              exit 1
             fi
-          done <<< "${CONFLICT_FILES}"
 
-          if [[ -n "${MARKER_FOUND}" ]]; then
-            notify_failure "agy 运行结束但以下文件仍残留冲突标记：${MARKER_FOUND}"
-            exit 1
-          fi
+            local status
+            status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json)
+            if [[ "${status}" != "SUCCESS" ]]; then
+              local err_msg
+              err_msg=$(jq -r '.error // "unknown error"' /tmp/agy_stdout.json)
+              notify_failure "agy 返回状态 ${status}：${err_msg}"
+              exit 1
+            fi
 
-          find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
-            ! -path '.github/workflows/sync-upstream.yml' \
-            -exec git rm -f --ignore-unmatch -- {} +
+            SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
+          }
 
-          if [[ -f .git/MERGE_HEAD ]]; then
+          clean_extra_workflows() {
+            find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
+              ! -path '.github/workflows/sync-upstream.yml' \
+              -exec git rm -f --ignore-unmatch -- {} +
+          }
+
+          # ====================================================================
+          # 路径 A：Git 文本层面无冲突合并 —— 先跑双向编译与回归测试拦截“语义冲突”
+          # ====================================================================
+          if [[ "${MERGE_STATUS}" == "merged_cleanly" ]]; then
+            if bash .github/workflows/verify-fork-driver.sh; then
+              cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY"
+              git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
+              MERGED_SHA=$(git rev-parse HEAD)
+              post_commit_status "${MERGED_SHA}" "success" "Clean merge verified: fmt + clippy + unit + Wayland + GTK3 AT-SPI passed"
+              close_stale_alert_issues "已无冲突合入 \`${TARGET_BRANCH}\` 并通过全部 5 层测试"
+              echo "Clean merge passed all 5 verification layers and was pushed to ${TARGET_BRANCH}!"
+              exit 0
+            fi
+
+            echo "⚠️ Clean Git merge failed bidirectional compile/test suite (semantic conflict)! Invoking agy to adapt..."
+            {
+              echo "当前仓库已将 upstream/main (${UPSTREAM_SHORT}) 无文本冲突合并进 ${TARGET_BRANCH}（位于当前 HEAD），但运行双向编译与回归测试未通过（出现了跨模块签名变更、Clippy 报错或回归测试失败）。"
+              echo "失败详情保存在 /tmp/verify_failure.log 中。"
+              echo "请严格按以下步骤修复："
+              echo "1. 阅读 /tmp/verify_failure.log，结合 git log HEAD^1 -n 10 与 git log HEAD^2 -n 10 理解本分支（Linux Wayland / cua-perception 定制）与上游最新改动的意图，做最小且准确的兼容修复；"
+              echo "2. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何 .yml/.yaml 文件；"
+              echo "3. 运行 cargo fmt --manifest-path libs/cua-driver/rust/Cargo.toml --all 确保格式完全合规；"
+              echo "4. 使用 git add 暂存修改并执行 git commit --amend --no-edit 更新当前合并提交；"
+              echo "5. 用清晰的中文说明导致测试失败的语义冲突原因以及你的适配方式（将写入 PR 描述）。"
+            } > /tmp/agy_semantic_prompt.txt
+
+            invoke_agy_with_prompt "$(cat /tmp/agy_semantic_prompt.txt)"
+            clean_extra_workflows
+            if ! git diff --quiet || ! git diff --cached --quiet; then
+              git add -u
+              git commit --amend --no-edit
+            fi
+
+            if ! bash .github/workflows/verify-fork-driver.sh; then
+              cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY" || true
+              notify_failure "无文本冲突合并触发语义/测试报错，经 agy 自动修复后仍未通过双向测试套件。"
+              exit 1
+            fi
+
+            PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并完成语义兼容适配"
+            PR_INTRO="上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`。Git 文本合并无冲突，但双向编译/回归测试捕获到跨侧语义影响，已由 **Antigravity CLI (\`agy\`)** 完成兼容适配并通过全部测试："
+          else
+            # ==================================================================
+            # 路径 B：Git 存在文本冲突 —— agy 解决冲突 + 跑全套双向测试（失败则二次修复）
+            # ==================================================================
+            {
+              echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。"
+              echo "当前环境已预装完整的 Rust 工具链（cargo / rustfmt / clippy）及 Linux 系统开发库。"
+              echo "请严格按以下步骤操作："
+              echo "1. 运行 git status 查看所有处于未合并冲突状态（UU/AA/DU/UD）的文件；"
+              echo "2. 阅读冲突文件的完整上下文，通过 git log MERGE_HEAD -n 15 -- <冲突文件> 查看官方最新改动意图，同时通过 git log HEAD -n 15 -- <冲突文件> 查看本分支（Linux Wayland 与感知优化）的定制改动意图，谨慎融合双方逻辑；"
+              echo "3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何 .yml/.yaml 工作流文件；"
+              echo "4. 运行 cargo fmt --manifest-path libs/cua-driver/rust/Cargo.toml --all 格式化代码，并运行 git diff --check 确保无任何残留冲突标记；"
+              echo "5. 使用 git add 暂存已解决的冲突文件，并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\" 完成合并提交；"
+              echo "6. 用清晰的中文逐个文件简要说明冲突原因以及你的融合解决方式（这段说明将直接写入 PR 描述供仓库维护者审阅）。"
+            } > /tmp/agy_conflict_prompt.txt
+
+            invoke_agy_with_prompt "$(cat /tmp/agy_conflict_prompt.txt)"
+
+            MARKER_FOUND=""
             while IFS= read -r cf; do
-              if [[ -n "$cf" && -e "$cf" ]]; then
-                git add -- "$cf"
+              if [[ -n "$cf" && -f "$cf" ]] && grep -nE '^(<<<<<<< |=======$|>>>>>>> )' -- "$cf" >/dev/null 2>&1; then
+                MARKER_FOUND="${MARKER_FOUND}${cf} "
               fi
             done <<< "${CONFLICT_FILES}"
-            if [[ -z "$(git diff --name-only --diff-filter=U)" ]]; then
-              git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
+
+            if [[ -n "${MARKER_FOUND}" ]]; then
+              notify_failure "agy 运行结束但以下文件仍残留冲突标记：${MARKER_FOUND}"
+              exit 1
             fi
-          elif ! git diff --cached --quiet; then
-            git commit --amend --no-edit
+
+            clean_extra_workflows
+
+            if [[ -f .git/MERGE_HEAD ]]; then
+              while IFS= read -r cf; do
+                if [[ -n "$cf" && -e "$cf" ]]; then
+                  git add -- "$cf"
+                fi
+              done <<< "${CONFLICT_FILES}"
+              if [[ -z "$(git diff --name-only --diff-filter=U)" ]]; then
+                git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
+              fi
+            elif ! git diff --cached --quiet; then
+              git commit --amend --no-edit
+            fi
+
+            if [[ -f .git/MERGE_HEAD ]] || [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
+              notify_failure "agy 运行结束但仍存在未完成提交的合并状态。"
+              exit 1
+            fi
+
+            # 运行 5 层双向验证；若首次未通过（例如格式缩进、Clippy 警告或单测断言），交给 agy 根据错误日志做一次精准修复
+            if ! bash .github/workflows/verify-fork-driver.sh; then
+              echo "⚠️ First verification pass failed after conflict resolution; invoking agy with /tmp/verify_failure.log..."
+              PREV_SUMMARY="${SUMMARY}"
+              {
+                echo "合并提交已完成，但运行双向编译、Clippy 与回归测试套件未通过，错误日志保存在 /tmp/verify_failure.log。"
+                echo "请按以下步骤修复："
+                echo "1. 阅读 /tmp/verify_failure.log 定位编译、格式、Clippy 或测试失败根因并修复，确保同时保留上游新逻辑与本分支定制能力；"
+                echo "2. 运行 cargo fmt --manifest-path libs/cua-driver/rust/Cargo.toml --all；"
+                echo "3. 执行 git add -u && git commit --amend --no-edit 更新当前合并提交；"
+                echo "4. 用中文简要补充本次编译/测试修复点。"
+              } > /tmp/agy_repair_prompt.txt
+
+              invoke_agy_with_prompt "$(cat /tmp/agy_repair_prompt.txt)"
+              clean_extra_workflows
+              if ! git diff --quiet || ! git diff --cached --quiet; then
+                git add -u
+                git commit --amend --no-edit
+              fi
+              SUMMARY=$(printf '%s\n\n**测试修复补充**：\n%s' "${PREV_SUMMARY}" "${SUMMARY}")
+
+              if ! bash .github/workflows/verify-fork-driver.sh; then
+                cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY" || true
+                notify_failure "冲突合并后经 agy 二次修复仍未通过双向编译与回归测试。"
+                exit 1
+              fi
+            fi
+
+            PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并解决冲突"
+            PR_INTRO="上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`，合并到 \`${TARGET_BRANCH}\` 时出现以下文件冲突，已由 **Antigravity CLI (\`agy\`)** 自动解决并通过全部双向测试："
           fi
 
-          if [[ -f .git/MERGE_HEAD ]] || [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
-            notify_failure "agy 运行结束但仍存在未完成提交的合并状态。"
-            exit 1
-          fi
+          cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY"
+          FINAL_SHA=$(git rev-parse HEAD)
 
-          # 5. 根据开关决定直接合入目标分支，还是在本仓库创建 PR 发通知确认
+          # 根据开关决定直接合入目标分支，还是在本仓库创建附带绿色测试报告的 PR
           RESULT_REF=""
           if [[ "${AUTO_MERGE_INPUT}" == "true" || "${AUTO_MERGE_VAR}" == "true" ]]; then
             git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
-            echo "Auto-merged resolved conflicts directly into ${TARGET_BRANCH}!"
+            post_commit_status "${FINAL_SHA}" "success" "5-layer bidirectional compile, clippy, unit, Wayland & GTK3 AT-SPI passed"
+            echo "Auto-merged verified changes directly into ${TARGET_BRANCH}!"
             RESULT_REF="已直接自动合并至 \`${TARGET_BRANCH}\`"
           else
             PR_BRANCH="auto-sync/${UPSTREAM_SHORT}-$(date -u +%Y%m%d-%H%M)"
             git push -u origin "HEAD:refs/heads/${PR_BRANCH}"
+            post_commit_status "${FINAL_SHA}" "success" "5-layer bidirectional compile, clippy, unit, Wayland & GTK3 AT-SPI passed"
 
             {
-              echo "## 🤖 自动同步冲突修复报告"
+              echo "## 🤖 自动同步修复与验证报告"
               echo ""
-              echo "上游仓库 \`${UPSTREAM_REPO}\` 的 \`main\` 分支更新至 \`${UPSTREAM_SHA}\`，合并到 \`${TARGET_BRANCH}\` 时出现以下文件冲突，已由 **Antigravity CLI (\`agy\`)** 自动分析并解决："
+              echo "${PR_INTRO}"
+              if [[ -n "${CONFLICT_FILES:-}" ]]; then
+                echo ""
+                echo "### 冲突文件列表"
+                echo "\`\`\`"
+                echo "${CONFLICT_FILES}"
+                echo "\`\`\`"
+              fi
               echo ""
-              echo "### 冲突文件列表"
-              echo "\`\`\`"
-              echo "${CONFLICT_FILES}"
-              echo "\`\`\`"
-              echo ""
-              echo "### AI 解决说明"
+              echo "### AI 融合与适配说明"
               printf '%s\n' "${SUMMARY}"
               echo ""
+              cat /tmp/verify_report.md
+              echo ""
               echo "---"
-              echo "> 确认代码改动无误后，直接点击下方 **Merge pull request** 即可合入 \`${TARGET_BRANCH}\`。"
-              echo "> *(后续若希望跳过人工确认直接自动合入，只需将仓库 \`Settings -> Secrets and variables -> Actions -> Variables\` 中的 \`AUTO_MERGE_CONFLICTS\` 改为 \`true\` 即可。)*"
+              echo "> 确认代码改动与上方测试结果无误后，直接点击下方 **Merge pull request** 即可合入 \`${TARGET_BRANCH}\`。"
+              echo "> *(后续若希望测试全绿时跳过人工确认直接合入，可将仓库 \`Settings -> Secrets and variables -> Actions -> Variables\` 中的 \`AUTO_MERGE_CONFLICTS\` 改为 \`true\`。)*"
             } > /tmp/pr_body.md
 
             PR_URL=$(jq -n \
-              --arg title "chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并解决冲突" \
+              --arg title "${PR_TITLE}" \
               --arg head "${PR_BRANCH}" \
               --arg base "${TARGET_BRANCH}" \
               --rawfile body /tmp/pr_body.md \
               '{title: $title, head: $head, base: $base, body: $body}' \
               | gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" --input - --jq '.html_url')
-            echo "Created conflict-resolution PR: ${PR_URL}"
-            RESULT_REF="已自动创建冲突解决 PR：${PR_URL}"
+            echo "Created verified sync PR: ${PR_URL}"
+            RESULT_REF="已自动创建并通过测试的 PR：${PR_URL}"
           fi
 
-          # 6. 若之前有自动同步告警 Issue，成功后自动评论并关闭
-          gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
-            --jq '.[] | select(.title | startswith("⚠️ 自动同步冲突需人工检查")) | .number' \
-            | while IFS= read -r inum; do
-                if [[ -n "$inum" ]]; then
-                  jq -n --arg body "✅ 最新同步运行已完成处理（${RESULT_REF}），自动关闭此告警。" '{body: $body}' \
-                    | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${inum}/comments" --input - >/dev/null || true
-                  printf '{"state":"closed"}' \
-                    | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${inum}" --input - >/dev/null || true
-                fi
-              done || true
+          close_stale_alert_issues "${RESULT_REF}"
+
+  verify:
+    name: Bidirectional Driver & Perception Regression Suite
+    if: github.event_name == 'pull_request' || inputs.verify_ref != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout base branch for verification runner
+        uses: actions/checkout@v5
+        with:
+          ref: feat/wayland-with-perception-opt
+          fetch-depth: 0
+
+      - name: Checkout target PR or commit and mark status pending
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
+          VERIFY_REF_INPUT: ${{ inputs.verify_ref }}
+        run: |
+          set -euo pipefail
+
+          cp .github/workflows/verify-fork-driver.sh /tmp/verify-fork-driver.sh
+          chmod +x /tmp/verify-fork-driver.sh
+
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          PR_NUMBER=""
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            git fetch origin "${PR_HEAD_SHA}"
+            git checkout --detach "${PR_HEAD_SHA}"
+            TESTED_SHA=$(git rev-parse HEAD)
+            PR_NUMBER="${PR_NUMBER_EVENT}"
+          else
+            git fetch origin "${VERIFY_REF_INPUT}" || true
+            if git rev-parse --verify --quiet "origin/${VERIFY_REF_INPUT}^{commit}" >/dev/null; then
+              git checkout --detach "origin/${VERIFY_REF_INPUT}"
+            else
+              git checkout --detach "${VERIFY_REF_INPUT}"
+            fi
+            TESTED_SHA=$(git rev-parse HEAD)
+            PR_NUMBER=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=50" \
+              --jq ".[] | select(.head.sha == \"${TESTED_SHA}\" or .head.ref == \"${VERIFY_REF_INPUT}\") | .number" \
+              | head -n 1 || true)
+          fi
+
+          echo "tested_sha=${TESTED_SHA}" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "Verifying exact commit ${TESTED_SHA} (PR: ${PR_NUMBER:-none})"
+
+          jq -n \
+            --arg state "pending" \
+            --arg target_url "${RUN_URL}" \
+            --arg description "Running 5-layer compile, clippy, unit, Wayland & GTK3 AT-SPI suite..." \
+            --arg context "${VERIFY_STATUS_CONTEXT}" \
+            '{state: $state, target_url: $target_url, description: $description, context: $context}' \
+            | gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" --input - >/dev/null || true
+
+      - name: Free runner disk space
+        uses: ./.github/actions/linux-rust-prep
+        with:
+          install-deps: "false"
+
+      - name: Install pinned Rust toolchain with rustfmt and clippy
+        run: |
+          set -euo pipefail
+          TOOLCHAIN=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' libs/cua-driver/rust/rust-toolchain.toml)
+          TOOLCHAIN="${TOOLCHAIN:-stable}"
+          rustup toolchain install "${TOOLCHAIN}" --profile minimal --component rustfmt --component clippy
+
+      - name: Configure Rust sccache
+        uses: ./.github/actions/rust-cache
+        with:
+          workspaces: "libs/cua-driver/rust -> target"
+          pr-save: "true"
+
+      - name: Install Linux build and headless desktop dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: >-
+            build-essential cmake clang pkg-config
+            libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev libei-dev
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libudev-dev
+            libx11-dev libx11-xcb-dev libxcb1-dev libxext-dev libxi-dev
+            libxtst-dev libxrandr-dev libgtk-3-dev
+            xvfb xauth x11-utils xdotool dbus-daemon dbus-x11 at-spi2-core
+            openbox picom python3-gi gir1.2-gtk-3.0 imagemagick ffmpeg
+
+      - name: Run 5-layer bidirectional verification and publish report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TESTED_SHA: ${{ steps.target.outputs.tested_sha }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          set +e
+          bash /tmp/verify-fork-driver.sh
+          VERIFY_RC=$?
+          set -e
+
+          if [[ -f /tmp/verify_report.md ]]; then
+            cat /tmp/verify_report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "${VERIFY_RC}" -eq 0 ]]; then
+            STATE="success"
+            DESC="All 5 layers passed (fmt + clippy + unit + Wayland portal + GTK3 AT-SPI)"
+          else
+            STATE="failure"
+            DESC="Bidirectional regression suite failed (exit ${VERIFY_RC})"
+          fi
+
+          jq -n \
+            --arg state "${STATE}" \
+            --arg target_url "${RUN_URL}" \
+            --arg description "${DESC}" \
+            --arg context "${VERIFY_STATUS_CONTEXT}" \
+            '{state: $state, target_url: $target_url, description: $description, context: $context}' \
+            | gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${TESTED_SHA}" --input - >/dev/null || true
+
+          if [[ -n "${PR_NUMBER}" && -f /tmp/verify_report.md ]]; then
+            MARKER="<!-- cua-fork-verify-report -->"
+            {
+              echo "${MARKER}"
+              cat /tmp/verify_report.md
+              if [[ "${VERIFY_RC}" -ne 0 && -s /tmp/verify_failure.log ]]; then
+                echo ""
+                echo "<details><summary>展开查看错误日志摘要</summary>"
+                echo ""
+                echo "\`\`\`text"
+                tail -n 100 /tmp/verify_failure.log
+                echo "\`\`\`"
+                echo "</details>"
+              fi
+              echo ""
+              echo "🔗 [查看完整 Actions 运行日志](${RUN_URL})"
+            } > /tmp/pr_verify_comment.md
+
+            EXISTING_COMMENT_ID=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=50" \
+              --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -n 1 || true)
+            if [[ -n "${EXISTING_COMMENT_ID}" ]]; then
+              jq -n --rawfile body /tmp/pr_verify_comment.md '{body: $body}' \
+                | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${EXISTING_COMMENT_ID}" --input - >/dev/null || true
+            else
+              jq -n --rawfile body /tmp/pr_verify_comment.md '{body: $body}' \
+                | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" --input - >/dev/null || true
+            fi
+          fi
+
+          exit "${VERIFY_RC}"
