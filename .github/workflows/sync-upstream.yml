@@ -191,6 +191,21 @@ jobs:
             libglib2.0-bin libatk-adaptor openbox picom python3-gi gir1.2-gtk-3.0
             imagemagick ffmpeg
 
+      - name: Enable mold fast linker
+        if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
+        run: |
+          if timeout 60 sudo apt-get install -y --no-install-recommends mold >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v mold)" /usr/local/bin/ld
+            sudo ln -sf "$(command -v mold)" /usr/bin/ld
+            echo "Enabled mold fast linker: $(ld --version | head -n 1)"
+          elif command -v ld.lld >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v ld.lld)" /usr/local/bin/ld
+            sudo ln -sf "$(command -v ld.lld)" /usr/bin/ld
+            echo "Enabled lld fast linker: $(ld --version | head -n 1)"
+          else
+            echo "Keeping system default linker: $(ld --version | head -n 1)"
+          fi
+
       - name: Closed-loop conflict resolution, 5-layer test verification, AI self-healing, and publish
         if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
         env:
@@ -211,7 +226,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          MAX_REPAIR_ROUNDS=6
+          MAX_REPAIR_ROUNDS=8
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           VERTEX_PROXY_PID=""
           VERTEX_PROXY_PORT=""
@@ -387,7 +402,8 @@ jobs:
 
           PATH_RE = re.compile(r"^/v1(?:beta1?)?/models/([^/:?]+):([^?]+)(?:\?(.*))?$")
           PROJ_ERR_RE = re.compile(r"projects/([^/`\"'\s]+)/locations/")
-          BACKOFF_SECS = (3, 7, 15, 25)
+          EFFORT_SUFFIX_RE = re.compile(r"^(.+)-(low|medium|high)$")
+          BACKOFF_SECS = (3, 7, 15)
 
 
           def build_vertex_url(model: str, action: str, query: str, project: str, location: str) -> str:
@@ -405,6 +421,71 @@ jobs:
               return f"{base}{path}?{query}" if query else f"{base}{path}"
 
 
+          def sanitize_payload_for_model(model: str, action: str, raw_body: bytes, forced_level: str = "") -> bytes:
+              if action not in ("generateContent", "streamGenerateContent"):
+                  return raw_body
+              try:
+                  payload = json.loads(raw_body)
+              except Exception:
+                  return raw_body
+              if not isinstance(payload, dict):
+                  return raw_body
+
+              changed = False
+              is_gemini4 = model.startswith("gemini-4")
+
+              if is_gemini4:
+                  for k in ("cachedContent", "cached_content"):
+                      if k in payload:
+                          payload.pop(k, None)
+                          changed = True
+
+              gen_cfg = payload.get("generationConfig")
+              if forced_level and not isinstance(gen_cfg, dict):
+                  gen_cfg = {}
+                  payload["generationConfig"] = gen_cfg
+                  changed = True
+
+              if isinstance(gen_cfg, dict):
+                  if is_gemini4:
+                      for k in (
+                          "temperature", "topP", "topK", "top_p", "top_k",
+                          "frequencyPenalty", "presencePenalty", "frequency_penalty", "presence_penalty",
+                      ):
+                          if k in gen_cfg:
+                              gen_cfg.pop(k, None)
+                              changed = True
+                      for ck in ("candidateCount", "candidate_count"):
+                          if ck in gen_cfg and isinstance(gen_cfg[ck], int) and gen_cfg[ck] > 1:
+                              gen_cfg[ck] = 1
+                              changed = True
+
+                  think_cfg = gen_cfg.get("thinkingConfig")
+                  if forced_level and not isinstance(think_cfg, dict):
+                      think_cfg = {"thinkingLevel": forced_level}
+                      gen_cfg["thinkingConfig"] = think_cfg
+                      changed = True
+                  elif isinstance(think_cfg, dict):
+                      has_budget = "thinkingBudget" in think_cfg or "thinking_budget" in think_cfg
+                      if is_gemini4 and has_budget:
+                          b1 = think_cfg.pop("thinkingBudget", None)
+                          b2 = think_cfg.pop("thinking_budget", None)
+                          budget = b1 if isinstance(b1, int) else (b2 if isinstance(b2, int) else -1)
+                          if "thinkingLevel" not in think_cfg and "thinking_level" not in think_cfg:
+                              think_cfg["thinkingLevel"] = forced_level or ("HIGH" if (budget < 0 or budget >= 4096) else "MEDIUM")
+                          changed = True
+                      if forced_level and "thinkingLevel" not in think_cfg and "thinking_level" not in think_cfg:
+                          think_cfg["thinkingLevel"] = forced_level
+                          changed = True
+                      if is_gemini4:
+                          for lk in ("thinkingLevel", "thinking_level"):
+                              if think_cfg.get(lk) == "MINIMAL":
+                                  think_cfg[lk] = "LOW"
+                                  changed = True
+
+              return json.dumps(payload).encode("utf-8") if changed else raw_body
+
+
           def strip_legacy_thinking_budget(raw_body: bytes):
               try:
                   payload = json.loads(raw_body)
@@ -414,10 +495,12 @@ jobs:
               if not isinstance(gen_cfg, dict):
                   return None
               think_cfg = gen_cfg.get("thinkingConfig")
-              if not isinstance(think_cfg, dict) or "thinkingBudget" not in think_cfg:
+              if not isinstance(think_cfg, dict) or ("thinkingBudget" not in think_cfg and "thinking_budget" not in think_cfg):
                   return None
-              budget = think_cfg.pop("thinkingBudget", -1)
-              if "thinkingLevel" not in think_cfg:
+              b1 = think_cfg.pop("thinkingBudget", None)
+              b2 = think_cfg.pop("thinking_budget", None)
+              budget = b1 if isinstance(b1, int) else (b2 if isinstance(b2, int) else -1)
+              if "thinkingLevel" not in think_cfg and "thinking_level" not in think_cfg:
                   think_cfg["thinkingLevel"] = "HIGH" if (budget < 0 or budget >= 4096) else "LOW"
               return json.dumps(payload).encode("utf-8")
 
@@ -444,9 +527,18 @@ jobs:
                       self._send_error_json(404, msg)
                       return
 
-                  model, action, query = m.group(1), m.group(2), m.group(3) or ""
+                  raw_model, action, query = m.group(1), m.group(2), m.group(3) or ""
+                  forced_level = ""
+                  em = EFFORT_SUFFIX_RE.match(raw_model)
+                  if em:
+                      model = em.group(1)
+                      forced_level = em.group(2).upper()
+                  else:
+                      model = raw_model
+
                   length = int(self.headers.get("Content-Length", 0))
-                  body = self.rfile.read(length)
+                  raw_body = self.rfile.read(length)
+                  body = sanitize_payload_for_model(model, action, raw_body, forced_level)
 
                   with _lock:
                       project = EXPLICIT_PROJECT or _discovered_project
@@ -460,11 +552,15 @@ jobs:
                       headers["Accept"] = self.headers["Accept"]
 
                   retry_idx = 0
-                  for _attempt in range(8):
+                  timeout_retried = False
+                  for _attempt in range(7):
                       url = build_vertex_url(model, action, query, project, location)
                       req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                      t0 = time.monotonic()
                       try:
-                          with urllib.request.urlopen(req, timeout=90) as resp:
+                          with urllib.request.urlopen(req, timeout=240) as resp:
+                              sys.stderr.write(f"[vertex_proxy] {model}:{action} -> HTTP {resp.status} (ttfb {time.monotonic() - t0:.1f}s)\n")
+                              sys.stderr.flush()
                               self.send_response(resp.status)
                               ctype = resp.headers.get("Content-Type", "application/json")
                               self.send_header("Content-Type", ctype)
@@ -479,7 +575,7 @@ jobs:
                               return
                       except urllib.error.HTTPError as e:
                           err_body = e.read()
-                          err_text = err_body.decode("utf-8", "replace")
+                          err_text = err_body.decode("utf-8", "replace").replace(API_KEY, "***")
                           if e.code == 404 and not project:
                               pm = PROJ_ERR_RE.search(err_text)
                               if pm:
@@ -496,11 +592,23 @@ jobs:
                           if e.code in (429, 500, 502, 503, 504) and retry_idx < len(BACKOFF_SECS):
                               wait_s = BACKOFF_SECS[retry_idx]
                               retry_idx += 1
-                              sys.stderr.write(f"[vertex_proxy] HTTP {e.code} on {model}; sleeping {wait_s}s before retry {retry_idx}...\n")
+                              sys.stderr.write(f"[vertex_proxy] HTTP {e.code} on {model}:{action}; sleeping {wait_s}s before retry {retry_idx}...\n")
                               sys.stderr.flush()
                               time.sleep(wait_s)
                               continue
+                          one_line = " ".join(err_text.split())[:220]
+                          sys.stderr.write(f"[vertex_proxy] HTTP {e.code} on {model}:{action}: {one_line}\n")
+                          sys.stderr.flush()
                           self._send_error_json(e.code, err_body)
+                          return
+                      except TimeoutError as e:
+                          if not timeout_retried:
+                              timeout_retried = True
+                              sys.stderr.write(f"[vertex_proxy] Socket timeout on {model}:{action}; retrying once...\n")
+                              sys.stderr.flush()
+                              continue
+                          msg = json.dumps({"error": {"code": 504, "message": f"Vertex proxy timeout: {e}"}}).encode()
+                          self._send_error_json(504, msg)
                           return
                       except Exception as e:
                           if retry_idx < len(BACKOFF_SECS):
@@ -528,7 +636,7 @@ jobs:
           PY
 
             rm -f /tmp/vertex_proxy.port
-            python3 /tmp/vertex_proxy.py /tmp/vertex_proxy.port &
+            python3 /tmp/vertex_proxy.py /tmp/vertex_proxy.port </dev/null >&2 &
             VERTEX_PROXY_PID=$!
             for _ in {1..50}; do
               if [[ -s /tmp/vertex_proxy.port ]]; then
@@ -570,6 +678,8 @@ jobs:
 
           invoke_agy_with_prompt() {
             local prompt_text="$1"
+            local tier="${2:-deep}"
+            local expect_edits="${3:-true}"
             ensure_agy_and_vertex_bridge
 
             local before_hash
@@ -590,56 +700,74 @@ jobs:
                 "$@" </dev/null >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
             }
 
-            set +e
-            run_once "6m" --effort high
-            local agy_rc=$?
-            local json_status after_hash
-            json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
-            after_hash=$(workspace_snapshot_hash)
-
-            if [[ $agy_rc -eq 3 && "${after_hash}" != "${before_hash}" ]] && ! has_remaining_conflict_markers; then
-              set -e
-              echo "⚠️ Default model hit print-timeout after completing clean workspace edits; proceeding to outer deterministic verification..."
-              SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
-              return 0
+            local -a candidates=()
+            if [[ "${tier}" == "fast" ]]; then
+              candidates=(
+                "gemini-3.8-flash-high|5m"
+                "gemini-4-carbon-high|7m"
+              )
+            else
+              candidates=(
+                "gemini-4-carbon-high|7m"
+                "gemini-4-argon-high|7m"
+                "gemini-3.8-flash-high|7m"
+              )
             fi
 
-            if [[ $agy_rc -ne 0 || "${json_status}" != "SUCCESS" ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|503|overloaded|model|DEADLINE_EXCEEDED|print_timeout|print timeout' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
-              echo "Default model hit quota/429, timeout, or unfinished edits; sleeping 5s and retrying with fast gemini-3.8-flash-high..."
-              sleep 5
-              run_once "10m" --model gemini-3.8-flash-high
+            local agy_rc=1
+            local json_status="ERROR"
+            local after_hash=""
+            local last_err=""
+            local idx=0
+            local total="${#candidates[@]}"
+
+            set +e
+            for entry in "${candidates[@]}"; do
+              idx=$((idx + 1))
+              local cand_model="${entry%%|*}"
+              local cand_tmo="${entry##*|}"
+              echo "🤖 [agy:${tier}] (${idx}/${total}) Invoking ${cand_model} (timeout ${cand_tmo})..."
+
+              run_once "${cand_tmo}" --model "${cand_model}"
               agy_rc=$?
               json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
               after_hash=$(workspace_snapshot_hash)
-            fi
+
+              if [[ $agy_rc -eq 0 && "${json_status}" == "SUCCESS" ]]; then
+                if has_remaining_conflict_markers; then
+                  last_err="${cand_model} returned SUCCESS but conflict markers still remain"
+                  echo "⚠️ [agy:${cand_model}] ${last_err}; trying next candidate..."
+                elif [[ "${expect_edits}" == "true" && "${after_hash}" == "${before_hash}" ]]; then
+                  last_err="${cand_model} returned SUCCESS without modifying workspace files"
+                  echo "⚠️ [agy:${cand_model}] ${last_err}; trying next candidate..."
+                else
+                  SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
+                  echo "✅ [agy:${cand_model}] Completed edits cleanly."
+                  set -e
+                  return 0
+                fi
+              elif [[ $agy_rc -eq 3 && "${after_hash}" != "${before_hash}" ]] && ! has_remaining_conflict_markers; then
+                echo "⚠️ [agy:${cand_model}] Hit print-timeout (${cand_tmo}) after writing clean workspace edits; proceeding to outer deterministic verification..."
+                SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
+                set -e
+                return 0
+              else
+                last_err=$(jq -r '.error // empty' /tmp/agy_stdout.json 2>/dev/null || true)
+                if [[ -z "${last_err}" ]]; then
+                  last_err=$(tail -n 6 /tmp/agy_stderr.log 2>/dev/null | tr '\n' ' ' || echo "exit code ${agy_rc}")
+                fi
+                echo "⚠️ [agy:${cand_model}] Unsuccessful (exit=${agy_rc}, status=${json_status}): ${last_err:0:240}"
+              fi
+
+              if [[ $idx -lt $total ]]; then
+                sleep 3
+              fi
+            done
             set -e
 
-            if [[ $agy_rc -ne 0 ]]; then
-              if [[ $agy_rc -eq 3 && "${after_hash}" != "${before_hash}" ]] && ! has_remaining_conflict_markers; then
-                echo "⚠️ Fallback model hit print-timeout after completing clean workspace edits; proceeding to outer deterministic verification..."
-                SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
-                return 0
-              fi
-              local err_msg
-              err_msg=$(jq -r '.error // empty' /tmp/agy_stdout.json 2>/dev/null || true)
-              if [[ -z "${err_msg}" ]]; then
-                err_msg=$(tail -n 20 /tmp/agy_stderr.log 2>/dev/null || echo "exit code ${agy_rc}")
-              fi
-              cat /tmp/agy_stderr.log >&2 || true
-              notify_failure "agy 执行返回非零状态（exit ${agy_rc}）：${err_msg}"
-              exit 1
-            fi
-
-            local status
-            status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json)
-            if [[ "${status}" != "SUCCESS" ]]; then
-              local err_msg
-              err_msg=$(jq -r '.error // "unknown error"' /tmp/agy_stdout.json)
-              notify_failure "agy 返回状态 ${status}：${err_msg}"
-              exit 1
-            fi
-
-            SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
+            cat /tmp/agy_stderr.log >&2 || true
+            notify_failure "agy 候选模型链（${tier}）均未完成有效修复（exit ${agy_rc} / ${json_status}）：${last_err}"
+            exit 1
           }
 
           clean_extra_workflows_and_format() {
@@ -664,7 +792,7 @@ jobs:
               echo "4. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何工作流文件；最后用简明中文说明冲突原因与融合方式。"
             } > /tmp/agy_conflict_prompt.txt
 
-            invoke_agy_with_prompt "$(cat /tmp/agy_conflict_prompt.txt)"
+            invoke_agy_with_prompt "$(cat /tmp/agy_conflict_prompt.txt)" "deep" "true"
 
             MARKER_FOUND=""
             while IFS= read -r cf; do
@@ -708,6 +836,7 @@ jobs:
           # ====================================================================
           REPAIR_ROUND=0
           VERIFIED_OK="false"
+          rm -f /tmp/verify_last_failure.env
 
           while true; do
             echo ""
@@ -723,7 +852,16 @@ jobs:
             fi
 
             REPAIR_ROUND=$((REPAIR_ROUND + 1))
-            echo "⚠️ Verification failed! Starting automated AI self-healing round ${REPAIR_ROUND}/${MAX_REPAIR_ROUNDS}..."
+            HEAL_TIER="deep"
+            if [[ -f /tmp/verify_last_failure.env ]]; then
+              FAILED_KIND=""
+              # shellcheck disable=SC1091
+              source /tmp/verify_last_failure.env
+              if [[ "${FAILED_KIND}" == "compile" ]]; then
+                HEAL_TIER="fast"
+              fi
+            fi
+            echo "⚠️ Verification failed (tier=${HEAL_TIER})! Starting automated AI self-healing round ${REPAIR_ROUND}/${MAX_REPAIR_ROUNDS}..."
 
             FAILURE_EXCERPT=$(head -n 200 /tmp/verify_failure.log)
             {
@@ -735,13 +873,13 @@ jobs:
               echo "================================================================================"
               echo ""
               echo "请严格遵循以下职责边界快速完成源码修复："
-              echo "1. 直接根据报错行号按行区间精准阅读仓库内的对应源码文件与 git log 上下文（遇到数千行的大文件时务必只按行号区间或符号搜索定位，不要逐段通读全文；不要读取 /tmp 外部目录，也**绝对禁止**在终端子命令里执行 cargo build / cargo clippy / cargo check / cargo test —— 外层流水线会在你返回后立即自动执行 cargo fmt --all 并重跑全套 5 层测试，若还有深层问题会自动进入下一轮反馈给你）；"
+              echo "1. 直接根据报错行号按行区间精准阅读仓库内的对应源码文件与 git log 上下文（遇到数千行的大文件时务必只按行号区间或符号搜索定位，不要逐段通读全文；不要读取 /tmp 外部目录，也**绝对禁止**在终端子命令里执行 cargo build / cargo clippy / cargo check / cargo test —— 外层流水线会在你返回后立即自动执行 cargo fmt --all 并重跑定向单测与全套 5 层测试，若还有深层问题会自动进入下一轮反馈给你）；"
               echo "2. 结合上下文同时保护上游最新改动与本分支定制能力（Wayland 窗口裁剪/拖拽/焦点、浏览器现有 Profile CDP 绑定、cua-perception 无损与批处理推理、AT-SPI 按钮回退），做最小、地道的等价代码修复；"
               echo "3. 【红线约束】严禁删除、注释或 #[ignore] 任何测试用例，严禁弱化测试断言，严禁添加文件级 #![allow(...)] 掩盖告警，严禁修改 .github/workflows/；"
               echo "4. 完成文件编辑保存即可（外层会自动执行 cargo fmt 与 git commit），最后用简明中文总结本轮修复的问题根因与改动点。"
             } > /tmp/agy_heal_prompt.txt
 
-            invoke_agy_with_prompt "$(cat /tmp/agy_heal_prompt.txt)"
+            invoke_agy_with_prompt "$(cat /tmp/agy_heal_prompt.txt)" "${HEAL_TIER}" "true"
             clean_extra_workflows_and_format
 
             if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -953,6 +1091,20 @@ jobs:
             xvfb xauth x11-utils xdotool dbus-daemon dbus-x11 at-spi2-core
             libglib2.0-bin libatk-adaptor openbox picom python3-gi gir1.2-gtk-3.0
             imagemagick ffmpeg
+
+      - name: Enable mold fast linker
+        run: |
+          if timeout 60 sudo apt-get install -y --no-install-recommends mold >/dev/null 2>&1 && command -v mold >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v mold)" /usr/local/bin/ld
+            sudo ln -sf "$(command -v mold)" /usr/bin/ld
+            echo "Enabled mold fast linker: $(ld --version | head -n 1)"
+          elif command -v ld.lld >/dev/null 2>&1; then
+            sudo ln -sf "$(command -v ld.lld)" /usr/local/bin/ld
+            sudo ln -sf "$(command -v ld.lld)" /usr/bin/ld
+            echo "Enabled lld fast linker: $(ld --version | head -n 1)"
+          else
+            echo "Keeping system default linker: $(ld --version | head -n 1)"
+          fi
 
       - name: Run 5-layer bidirectional verification and publish report
         env:

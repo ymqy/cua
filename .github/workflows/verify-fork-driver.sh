@@ -13,6 +13,7 @@ RUST_WS="${REPO_ROOT}/libs/cua-driver/rust"
 REPORT_FILE="${VERIFY_REPORT_FILE:-/tmp/verify_report.md}"
 FAILURE_LOG="${VERIFY_FAILURE_LOG:-/tmp/verify_failure.log}"
 RAW_LOG="/tmp/verify_step_raw.log"
+LAST_FAIL_ENV="/tmp/verify_last_failure.env"
 
 rm -f "${REPORT_FILE}" "${FAILURE_LOG}" "${RAW_LOG}"
 
@@ -25,6 +26,59 @@ cd "${RUST_WS}"
 
 declare -a LAYER_ROWS=()
 SUITE_START=$(date +%s)
+
+record_failure_metadata() {
+  local layer_id="$1"
+  python3 - "${RAW_LOG}" "${layer_id}" > "${LAST_FAIL_ENV}" <<'PY'
+import re
+import shlex
+import sys
+
+raw_path, layer_id = sys.argv[1], sys.argv[2]
+try:
+    with open(raw_path, "r", encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+except Exception:
+    text = ""
+
+has_compile_err = bool(re.search(r"(?m)^error(\[E\d+\]|: could not compile)", text))
+kind = "compile" if (layer_id in ("1", "2") or has_compile_err) else "runtime_test"
+
+reruns = []
+for m in re.finditer(r"error: test failed, to rerun pass '([^']+)'", text):
+    spec = m.group(1).strip()
+    if spec and spec not in reruns:
+        reruns.append(spec)
+
+tests = []
+for m in re.finditer(r"(?m)^test (\S+) \.\.\. FAILED$", text):
+    t = m.group(1).strip()
+    if t and t not in tests:
+        tests.append(t)
+
+rerun_spec = reruns[0] if len(reruns) == 1 else ""
+test_filter = ""
+if tests:
+    if len(tests) == 1:
+        test_filter = tests[0]
+    else:
+        parts = [t.split("::") for t in tests]
+        common = []
+        for segs in zip(*parts):
+            if len(set(segs)) == 1:
+                common.append(segs[0])
+            else:
+                break
+        if common:
+            test_filter = "::".join(common)
+
+print(f"FAILED_LAYER_ID={shlex.quote(layer_id)}")
+print(f"FAILED_KIND={shlex.quote(kind)}")
+print(f"FAILED_RERUN_SPEC={shlex.quote(rerun_spec)}")
+print(f"FAILED_TEST_FILTER={shlex.quote(test_filter)}")
+print(f"FAILED_TESTS_JOINED={shlex.quote(' '.join(tests[:8]))}")
+PY
+}
 
 run_layer() {
   local layer_id="$1"
@@ -65,6 +119,7 @@ run_layer() {
   else
     echo "❌ [${layer_id}] 失败 (exit ${rc}, ${elapsed}s)" >&2
     LAYER_ROWS+=("| ❌ 失败 | **${layer_id}. ${layer_title}** | ${layer_scope} | ${elapsed}s |")
+    record_failure_metadata "${layer_id}" || true
     {
       echo "Failed layer: [${layer_id}] ${layer_title} (exit ${rc})"
       echo "Full raw log path: ${RAW_LOG}"
@@ -202,6 +257,54 @@ run_layer "1" "代码格式与依赖图守卫" \
   "rustfmt 格式一致性 + AT-SPI 无 p2p 特性泄漏契约" \
   layer_1_fmt_and_graph
 
+if [[ -f "${LAST_FAIL_ENV}" ]]; then
+  FAILED_LAYER_ID=""
+  FAILED_RERUN_SPEC=""
+  FAILED_TEST_FILTER=""
+  FAILED_TESTS_JOINED=""
+  # shellcheck disable=SC1090
+  source "${LAST_FAIL_ENV}"
+
+  SAVED_ROWS=("${LAYER_ROWS[@]}")
+  if [[ "${FAILED_LAYER_ID}" == "3" && -n "${FAILED_RERUN_SPEC}" ]]; then
+    read -r -a SPEC_ARGS <<< "${FAILED_RERUN_SPEC}"
+    layer_3_targeted_precheck() {
+      cargo build --locked -p cua-driver --bin cua-driver
+      if [[ -n "${FAILED_TEST_FILTER}" ]]; then
+        timeout --kill-after=10s 180s env CUA_TEST_REQUIRE_DRIVER_BIN=1 \
+          cargo test --locked "${SPEC_ARGS[@]}" -- "${FAILED_TEST_FILTER}"
+      elif [[ -n "${FAILED_TESTS_JOINED}" ]]; then
+        cargo test --locked "${SPEC_ARGS[@]}" --no-run
+        local single_test
+        for single_test in ${FAILED_TESTS_JOINED}; do
+          timeout --kill-after=10s 120s env CUA_TEST_REQUIRE_DRIVER_BIN=1 \
+            cargo test --locked "${SPEC_ARGS[@]}" -- "${single_test}"
+        done
+      else
+        timeout --kill-after=10s 240s env CUA_TEST_REQUIRE_DRIVER_BIN=1 \
+          cargo test --locked "${SPEC_ARGS[@]}"
+      fi
+    }
+    run_layer "3" "上次失败单测极速复测 (${FAILED_RERUN_SPEC})" \
+      "定向快速验证本轮修复是否已消除上次失败断言（通过后继续全量 5 层回归认证）" \
+      layer_3_targeted_precheck
+    rm -f "${LAST_FAIL_ENV}"
+    LAYER_ROWS=("${SAVED_ROWS[@]}")
+  elif [[ "${FAILED_LAYER_ID}" == "4" ]]; then
+    run_layer "4" "Wayland Portal 极速复测" \
+      "定向快速验证 Wayland Portal 修复（通过后继续全量 5 层回归认证）" \
+      layer_4_wayland_portal_tests
+    rm -f "${LAST_FAIL_ENV}"
+    LAYER_ROWS=("${SAVED_ROWS[@]}")
+  elif [[ "${FAILED_LAYER_ID}" == "5" ]]; then
+    run_layer "5" "无头桌面与 GTK3/AT-SPI 极速复测" \
+      "定向快速验证 X11/GTK3 AT-SPI 修复（通过后继续全量 5 层回归认证）" \
+      layer_5_headless_desktop_and_gtk_atspi
+    rm -f "${LAST_FAIL_ENV}"
+    LAYER_ROWS=("${SAVED_ROWS[@]}")
+  fi
+fi
+
 run_layer "2" "全工作区与 Wayland Portal 静态编译检查" \
   "全 crates/tests Clippy (-D warnings) + portal-input/portal-capture 交叉编译签名校验" \
   layer_2_clippy_and_features
@@ -218,6 +321,7 @@ run_layer "5" "无头桌面输入与 GTK3/AT-SPI 菜单回归测试" \
   "Xvfb + D-Bus + Openbox 真实点击/按键时序 + GTK3 后台菜单激活与防吞键回归 (native.rs)" \
   layer_5_headless_desktop_and_gtk_atspi
 
+rm -f "${LAST_FAIL_ENV}"
 write_report "PASSED"
 echo ""
 cat "${REPORT_FILE}"
