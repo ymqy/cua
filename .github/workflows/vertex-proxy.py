@@ -415,24 +415,42 @@ def make_handler(state: BridgeState):
     return VertexBridgeHandler
 
 
-def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
-    """Send minimal generateContent ping to Vertex AI for each target model with retry on transient timeouts."""
-    probe_timeout = float(os.environ.get("VERTEX_PROBE_TIMEOUT_SECS", "45"))
+def probe_live_vertex(
+    state: BridgeState, models: list[str], healthy_order_file: str = ""
+) -> int:
+    """Verify Vertex AI access for allowed models via streamGenerateContent SSE first-chunk probe.
+
+    - Hard-fails immediately (rc=1) on policy violations or 4xx auth/contract errors (400/401/403/404).
+    - Retries transient upstream capacity/timeout spikes and records responsive model priority order;
+      hard-fails (rc=1) if neither allowed model responds.
+    """
+    probe_timeout = float(os.environ.get("VERTEX_PROBE_TIMEOUT_SECS", "80"))
+    max_retries = min(
+        len(state.backoff_secs),
+        max(0, int(os.environ.get("VERTEX_PROBE_MAX_RETRIES", "1"))),
+    )
+    healthy_models: list[str] = []
+    degraded_models: list[str] = []
+
     for raw_model in models:
         model, forced_level, _ = resolve_and_validate_model(raw_model)
         if model is None:
             sys.stderr.write(f"[probe] Model '{raw_model}' disallowed by policy.\n")
+            sys.stderr.flush()
             return 1
 
         raw_payload = json.dumps(
             {
-                "contents": [{"role": "user", "parts": [{"text": "Reply with OK only."}]}],
+                "contents": [{"role": "user", "parts": [{"text": "Reply OK"}]}],
                 "generationConfig": {
+                    "maxOutputTokens": 8,
                     "thinkingConfig": {"thinkingLevel": forced_level or "LOW"},
                 },
             }
         ).encode("utf-8")
-        body = sanitize_payload_for_model(model, "generateContent", raw_payload, forced_level or "LOW")
+        body = sanitize_payload_for_model(
+            model, "streamGenerateContent", raw_payload, forced_level or "LOW"
+        )
 
         with state.lock:
             project = state.explicit_project or state.discovered_project
@@ -440,31 +458,54 @@ def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
 
         headers = {
             "Content-Type": "application/json",
+            "Accept": "text/event-stream",
             "x-goog-api-key": state.api_key,
         }
 
         retry_idx = 0
-        max_attempts = len(state.backoff_secs) + 3
+        max_attempts = max_retries + 3
         ok = False
+        last_transient_err = ""
         for _attempt in range(max_attempts):
             url = build_vertex_url(
-                model, "generateContent", "", project, location, state.upstream_override
+                model, "streamGenerateContent", "alt=sse", project, location, state.upstream_override
             )
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             t0 = time.monotonic()
             try:
                 with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
-                    resp_bytes = resp.read()
+                    ctype = resp.headers.get("Content-Type", "")
+                    parsed = None
+                    if "text/event-stream" in ctype:
+                        for _ in range(64):
+                            raw_line = resp.readline()
+                            if not raw_line:
+                                break
+                            line_str = raw_line.decode("utf-8", "replace").strip()
+                            if line_str.startswith("data:"):
+                                data_str = line_str[5:].strip()
+                                if data_str and data_str != "[DONE]":
+                                    parsed = json.loads(data_str)
+                                    if isinstance(parsed, dict) and "candidates" in parsed:
+                                        break
+                    else:
+                        resp_bytes = resp.read()
+                        parsed = json.loads(resp_bytes.decode("utf-8", "replace"))
+                        if isinstance(parsed, list) and parsed:
+                            parsed = parsed[0]
+
                     elapsed = time.monotonic() - t0
-                    parsed = json.loads(resp_bytes.decode("utf-8", "replace"))
                     if not isinstance(parsed, dict) or "candidates" not in parsed:
                         sys.stderr.write(
-                            f"[probe] Unexpected response payload for {model}: {resp_bytes[:200]!r}\n"
+                            f"[probe] Unexpected response payload for {model}: {parsed!r}\n"
                         )
+                        sys.stderr.flush()
                         return 1
                     print(
-                        f"[probe] OK {model} (HTTP {resp.status}, {elapsed:.2f}s, project={project or 'publisher'})"
+                        f"[probe] OK {model} (HTTP {resp.status}, {elapsed:.2f}s, project={project or 'publisher'})",
+                        flush=True,
                     )
+                    healthy_models.append(model)
                     ok = True
                     break
             except urllib.error.HTTPError as e:
@@ -479,35 +520,62 @@ def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
                         with state.lock:
                             state.discovered_project = project
                         continue
-                if e.code in (429, 500, 502, 503, 504) and retry_idx < len(state.backoff_secs):
-                    wait_s = state.backoff_secs[retry_idx]
-                    retry_idx += 1
-                    sys.stderr.write(
-                        f"[probe] HTTP {e.code} on {model}; sleeping {wait_s}s before retry {retry_idx}/{len(state.backoff_secs)}...\n"
-                    )
-                    sys.stderr.flush()
-                    time.sleep(wait_s)
-                    continue
+                if e.code in (408, 429, 500, 502, 503, 504):
+                    last_transient_err = f"HTTP {e.code}: {' '.join(err_text.split())[:180]}"
+                    if retry_idx < max_retries:
+                        wait_s = state.backoff_secs[retry_idx]
+                        retry_idx += 1
+                        sys.stderr.write(
+                            f"[probe] HTTP {e.code} on {model}; sleeping {wait_s}s before retry {retry_idx}/{max_retries}...\n"
+                        )
+                        sys.stderr.flush()
+                        time.sleep(wait_s)
+                        continue
+                    break
                 sys.stderr.write(
                     f"[probe] FAILED {model}: HTTP {e.code}: {' '.join(err_text.split())[:240]}\n"
                 )
+                sys.stderr.flush()
                 return 1
             except Exception as e:
-                if retry_idx < len(state.backoff_secs):
+                last_transient_err = str(e)
+                if retry_idx < max_retries:
                     wait_s = state.backoff_secs[retry_idx]
                     retry_idx += 1
                     sys.stderr.write(
-                        f"[probe] Transient error on {model} ({e}); sleeping {wait_s}s before retry {retry_idx}/{len(state.backoff_secs)}...\n"
+                        f"[probe] Transient error on {model} ({e}); sleeping {wait_s}s before retry {retry_idx}/{max_retries}...\n"
                     )
                     sys.stderr.flush()
                     time.sleep(wait_s)
                     continue
-                sys.stderr.write(f"[probe] ERROR {model} after {retry_idx} retries: {e}\n")
-                return 1
+                break
 
         if not ok:
-            sys.stderr.write(f"[probe] Exhausted retries for {model}\n")
-            return 1
+            degraded_models.append(model)
+            sys.stderr.write(
+                f"[probe] WARN {model} experiencing upstream Vertex capacity/timeout ({last_transient_err}); checking remaining allowed pair model...\n"
+            )
+            sys.stderr.flush()
+
+    if healthy_order_file:
+        tmp_path = f"{healthy_order_file}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            for hm in healthy_models:
+                fh.write(f"{hm}\n")
+        os.replace(tmp_path, healthy_order_file)
+
+    if not healthy_models:
+        sys.stderr.write(
+            f"[probe] FAILED: Neither allowed Vertex model responded ({', '.join(degraded_models)}).\n"
+        )
+        sys.stderr.flush()
+        return 1
+
+    if degraded_models:
+        print(
+            f"[probe] DEGRADED-OK: healthy={','.join(healthy_models)} degraded={','.join(degraded_models)} (healthy pair model will lead first)",
+            flush=True,
+        )
     return 0
 
 
@@ -524,6 +592,11 @@ def main() -> int:
         default="gemini-4-argon,gemini-3.8-flash",
         help="Comma-separated models for --probe-vertex",
     )
+    parser.add_argument(
+        "--write-healthy-order",
+        default="",
+        help="Optional file path to record healthy model names in probe success order",
+    )
     args = parser.parse_args()
 
     api_key = os.environ.get("VERTEX_API_KEY", "").strip()
@@ -539,7 +612,7 @@ def main() -> int:
 
     if args.probe_vertex:
         target_models = [m.strip() for m in args.models.split(",") if m.strip()]
-        return probe_live_vertex(state, target_models)
+        return probe_live_vertex(state, target_models, args.write_healthy_order)
 
     if not args.port_file:
         sys.stderr.write("[vertex_proxy] port_file is required when running server mode.\n")

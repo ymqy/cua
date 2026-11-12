@@ -50,6 +50,8 @@ class _MockVertexUpstream:
         self.mode = "normal"
         self.rate_limit_remaining = 0
         self.stall_remaining = 0
+        self.stall_models: set[str] = set()
+        self.error_by_model: dict[str, int] = {}
 
         outer = self
 
@@ -79,9 +81,18 @@ class _MockVertexUpstream:
                     rl_rem = outer.rate_limit_remaining
                     if rl_rem > 0:
                         outer.rate_limit_remaining -= 1
-                    stall = outer.stall_remaining > 0 and "/projects/" in self.path
-                    if stall:
+                    stall = "/projects/" in self.path and (
+                        outer.stall_remaining > 0
+                        or any(f"/models/{m}:" in self.path for m in outer.stall_models)
+                    )
+                    if outer.stall_remaining > 0 and "/projects/" in self.path:
                         outer.stall_remaining -= 1
+                    forced_err = 0
+                    if "/projects/" in self.path:
+                        for m, code in outer.error_by_model.items():
+                            if f"/models/{m}:" in self.path:
+                                forced_err = code
+                                break
 
                 # Simulate publisher 404 when project is missing so auto-discovery is tested.
                 if "/projects/" not in self.path:
@@ -93,6 +104,16 @@ class _MockVertexUpstream:
                     }
                     payload = json.dumps(err).encode("utf-8")
                     self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+
+                if forced_err:
+                    err = {"error": {"code": forced_err, "message": f"Forced error {forced_err}"}}
+                    payload = json.dumps(err).encode("utf-8")
+                    self.send_response(forced_err)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
@@ -886,7 +907,98 @@ class SyncInfraTests(unittest.TestCase):
             self.assertEqual((libs / "clean.rs").read_text(encoding="utf-8"), "pub fn clean() -> i32 { 42 }\n")
             self.assertFalse((libs / "stray.rs").exists())
 
+    def test_probe_degraded_single_model_and_candidate_reordering(self):
+        lib_path = WF_DIR / "agy-sync-lib.sh"
+        upstream = _MockVertexUpstream()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                health_file = Path(tmp) / "healthy.txt"
+                env = os.environ.copy()
+                env["VERTEX_API_KEY"] = "test-secret-vertex-key"
+                env["VERTEX_PROJECT_ID"] = "987654321"
+                env["VERTEX_UPSTREAM_BASE_URL"] = f"http://127.0.0.1:{upstream.port}"
+                env["VERTEX_PROBE_TIMEOUT_SECS"] = "0.08"
+                env["VERTEX_PROBE_MAX_RETRIES"] = "1"
+                env["VERTEX_BACKOFF_SECS"] = "0.03"
+
+                # 1. Argon congested (timeout) while 3.8 Flash healthy -> DEGRADED-OK (rc=0) & promotes Flash to (1/2)
+                with upstream.lock:
+                    upstream.stall_models = {"gemini-4-argon"}
+                    upstream.error_by_model = {}
+                res_deg = subprocess.run(
+                    [
+                        "python3",
+                        str(WF_DIR / "vertex-proxy.py"),
+                        "--probe-vertex",
+                        "--models",
+                        "gemini-3.8-flash,gemini-4-argon",
+                        "--write-healthy-order",
+                        str(health_file),
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(res_deg.returncode, 0, res_deg.stderr)
+                self.assertIn("DEGRADED-OK", res_deg.stdout)
+                self.assertEqual(health_file.read_text(encoding="utf-8").strip(), "gemini-3.8-flash")
+
+                ordered = subprocess.check_output(
+                    [
+                        "bash",
+                        "-c",
+                        f"source {shlex.quote(str(lib_path))} && select_agy_candidates_for_tier deep {shlex.quote(str(health_file))}",
+                    ],
+                    text=True,
+                ).splitlines()
+                self.assertEqual(
+                    ordered,
+                    ["gemini-3.8-flash-high|12m", "gemini-4-argon-high|14m"],
+                )
+
+                # 2. Hard 400/403 contract/auth error on Argon MUST still fail immediately (rc=1)
+                with upstream.lock:
+                    upstream.stall_models = set()
+                    upstream.error_by_model = {"gemini-4-argon": 400}
+                res_400 = subprocess.run(
+                    [
+                        "python3",
+                        str(WF_DIR / "vertex-proxy.py"),
+                        "--probe-vertex",
+                        "--models",
+                        "gemini-3.8-flash,gemini-4-argon",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(res_400.returncode, 1)
+
+                # 3. Both models timing out MUST fail (rc=1)
+                with upstream.lock:
+                    upstream.stall_models = {"gemini-3.8-flash", "gemini-4-argon"}
+                    upstream.error_by_model = {}
+                res_both = subprocess.run(
+                    [
+                        "python3",
+                        str(WF_DIR / "vertex-proxy.py"),
+                        "--probe-vertex",
+                        "--models",
+                        "gemini-3.8-flash,gemini-4-argon",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                self.assertEqual(res_both.returncode, 1)
+        finally:
+            upstream.close()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 

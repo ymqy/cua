@@ -284,9 +284,12 @@ preflight_ai_toolchain() {
     if [[ ! -f "${proxy_script}" ]]; then
       proxy_script=".github/workflows/vertex-proxy.py"
     fi
+    mkdir -p "${SYNC_BIN_DIR}"
     echo "🔎 Probing live Vertex AI access for gemini-3.8-flash and gemini-4-argon..."
-    if ! python3 "${proxy_script}" --probe-vertex --models "gemini-3.8-flash,gemini-4-argon"; then
-      echo "ERROR: Live Vertex AI connectivity/quota probe failed for Argon or 3.8 Flash." >&2
+    if ! python3 "${proxy_script}" --probe-vertex \
+      --models "gemini-3.8-flash,gemini-4-argon" \
+      --write-healthy-order "${SYNC_BIN_DIR}/vertex_healthy_models.txt"; then
+      echo "ERROR: Live Vertex AI connectivity/quota probe failed for Argon and 3.8 Flash." >&2
       return 1
     fi
   fi
@@ -515,6 +518,41 @@ restore_agy_workspace_checkpoint() {
   done < <(git ls-files --others --exclude-standard -- "${scope}" 2>/dev/null || true)
 }
 
+select_agy_candidates_for_tier() {
+  # STRICT TWO-MODEL POLICY: ONLY Gemini 4 Argon & Gemini 3.8 Flash.
+  # Dynamically promotes the responsive pair model to (1/2) when preflight or an earlier
+  # round detected Vertex preview queue timeouts on the other model.
+  local tier="${1:-deep}"
+  local health_file="${2:-${SYNC_BIN_DIR}/vertex_healthy_models.txt}"
+  local argon_ok="true"
+  local flash_ok="true"
+
+  if [[ -s "${health_file}" ]]; then
+    argon_ok="false"
+    flash_ok="false"
+    if grep -Fxq "gemini-4-argon" "${health_file}" 2>/dev/null; then
+      argon_ok="true"
+    fi
+    if grep -Fxq "gemini-3.8-flash" "${health_file}" 2>/dev/null; then
+      flash_ok="true"
+    fi
+  fi
+
+  if [[ "${tier}" == "fast" ]]; then
+    if [[ "${flash_ok}" == "false" && "${argon_ok}" == "true" ]]; then
+      printf '%s\n' "gemini-4-argon-high|14m" "gemini-3.8-flash-high|10m"
+    else
+      printf '%s\n' "gemini-3.8-flash-high|10m" "gemini-4-argon-high|14m"
+    fi
+  else
+    if [[ "${argon_ok}" == "false" && "${flash_ok}" == "true" ]]; then
+      printf '%s\n' "gemini-3.8-flash-high|12m" "gemini-4-argon-high|14m"
+    else
+      printf '%s\n' "gemini-4-argon-high|14m" "gemini-3.8-flash-high|12m"
+    fi
+  fi
+}
+
 invoke_agy_with_prompt() {
   local prompt_text="$1"
   local tier="${2:-deep}"
@@ -546,18 +584,9 @@ invoke_agy_with_prompt() {
   before_hash=$(workspace_snapshot_hash)
 
   # STRICT TWO-MODEL POLICY: ONLY Gemini 4 Argon & Gemini 3.8 Flash.
+  local health_file="${SYNC_BIN_DIR}/vertex_healthy_models.txt"
   local -a candidates=()
-  if [[ "${tier}" == "fast" ]]; then
-    candidates=(
-      "gemini-3.8-flash-high|10m"
-      "gemini-4-argon-high|14m"
-    )
-  else
-    candidates=(
-      "gemini-4-argon-high|14m"
-      "gemini-3.8-flash-high|12m"
-    )
-  fi
+  mapfile -t candidates < <(select_agy_candidates_for_tier "${tier}" "${health_file}")
 
   local agy_rc=1
   local json_status="ERROR"
@@ -565,6 +594,7 @@ invoke_agy_with_prompt() {
   local last_err=""
   local idx=0
   local total="${#candidates[@]}"
+  local prev_timed_out="false"
   local entry cand_model cand_tmo
 
   set +e
@@ -604,6 +634,10 @@ invoke_agy_with_prompt() {
         echo "⚠️ [agy:${cand_model}] ${last_err}; trying remaining pair model..."
       else
         SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
+        if [[ "${prev_timed_out}" == "true" ]]; then
+          mkdir -p "${SYNC_BIN_DIR}"
+          printf '%s\n' "${cand_model%-*}" > "${health_file}" 2>/dev/null || true
+        fi
         echo "✅ [agy:${cand_model}] Completed edits cleanly."
         rm -rf "${ckpt_dir}"
         set -e
@@ -616,6 +650,9 @@ invoke_agy_with_prompt() {
       set -e
       return 0
     else
+      if [[ "${agy_rc}" -eq 3 ]]; then
+        prev_timed_out="true"
+      fi
       last_err=$(jq -r '.error // empty' /tmp/agy_stdout.json 2>/dev/null || true)
       if [[ -z "${last_err}" ]]; then
         last_err=$(tail -n 8 /tmp/agy_stderr.log 2>/dev/null | tr '\n' ' ' || echo "exit code ${agy_rc}")
