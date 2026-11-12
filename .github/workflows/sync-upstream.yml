@@ -65,7 +65,6 @@ jobs:
           git config user.name "Ming Ye"
           git config user.email "22427967+ymqy@users.noreply.github.com"
 
-          # 先把主分支最新的 5 层双向验证脚本复制到 /tmp，确保检出任意分支/状态时始终可用且不污染工作区
           cp .github/workflows/verify-fork-driver.sh /tmp/verify-fork-driver.sh
           chmod +x /tmp/verify-fork-driver.sh
 
@@ -92,9 +91,9 @@ jobs:
             exit 0
           fi
 
-          # 3. 检查本仓库是否已有针对该上游 commit 的待合并 auto-sync PR：
-          #    - 若该 PR 已经通过 5 层测试（status == success），直接极速退出等待人工合并；
-          #    - 若该 PR 尚未通过测试（failure / pending / none），自动检出该 PR 分支进入 AI 自愈闭环！
+          # 3. 检查本仓库是否已有针对当前最新上游 commit 的待合并 auto-sync PR：
+          #    - 若已通过 5 层测试（status == success），极速退出等待人工合并；
+          #    - 若尚未通过测试（failure / pending / none），检出该 PR 分支进入 AI 自愈闭环。
           EXISTING_PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${TARGET_BRANCH}&per_page=50" \
             --jq "[.[] | select(.head.ref | startswith(\"auto-sync/${UPSTREAM_SHORT}\"))][0] // empty" || true)
           if [[ -n "${EXISTING_PR_JSON}" ]]; then
@@ -170,11 +169,13 @@ jobs:
           rustup toolchain install "${TOOLCHAIN}" --profile minimal --component rustfmt --component clippy
 
       - name: Configure Rust sccache
+        id: rust_cache
         if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
         uses: ./.github/actions/rust-cache
         with:
           workspaces: "libs/cua-driver/rust -> target"
           pr-save: "true"
+          save-always: "true"
 
       - name: Install Linux build and headless desktop dependencies
         if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
@@ -261,6 +262,23 @@ jobs:
               jq -n --rawfile body /tmp/pr_verify_comment.md '{body: $body}' \
                 | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${pr_num}/comments" --input - >/dev/null || true
             fi
+          }
+
+          close_superseded_sync_prs() {
+            local keep_branch="$1"
+            local replacement_desc="$2"
+            gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${TARGET_BRANCH}&per_page=50" \
+              --jq ".[] | select((.head.ref | startswith(\"auto-sync/\")) and (.head.ref != \"${keep_branch}\")) | \"\(.number) \(.head.ref)\"" \
+              | while read -r old_num old_ref; do
+                  if [[ -n "${old_num}" ]]; then
+                    jq -n --arg body "🔄 上游已有更新且新同步结果已通过全部 5 层双向回归测试（${replacement_desc}），自动关闭此旧同步 PR 并清理分支 \`${old_ref}\`。" \
+                      '{body: $body}' \
+                      | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${old_num}/comments" --input - >/dev/null || true
+                    printf '{"state":"closed"}' \
+                      | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${old_num}" --input - >/dev/null || true
+                    git push origin --delete "${old_ref}" >/dev/null 2>&1 || true
+                  fi
+                done || true
           }
 
           close_stale_alert_issues() {
@@ -529,8 +547,8 @@ jobs:
                 --settings '{"modelProvider":"gemini"}' \
                 --dangerously-skip-permissions \
                 --output-format json \
-                --print-timeout 20m \
-                "$@" >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
+                --print-timeout 8m \
+                "$@" </dev/null >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
             }
 
             set +e
@@ -544,6 +562,12 @@ jobs:
             set -e
 
             if [[ $agy_rc -ne 0 ]]; then
+              # 若 agy 已完成源码修改仅在收尾阶段超时，保留其代码改动交由外层确定性测试套件检验
+              if [[ $agy_rc -eq 3 ]] && { ! git diff --quiet || ! git diff --cached --quiet; }; then
+                echo "⚠️ agy hit print-timeout after modifying workspace files; proceeding to outer deterministic verification..."
+                SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
+                return 0
+              fi
               local err_msg
               err_msg=$(jq -r '.error // empty' /tmp/agy_stdout.json 2>/dev/null || true)
               if [[ -z "${err_msg}" ]]; then
@@ -566,26 +590,25 @@ jobs:
             SUMMARY=$(jq -r '.response // ""' /tmp/agy_stdout.json)
           }
 
-          clean_extra_workflows() {
+          clean_extra_workflows_and_format() {
             find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) \
               ! -path '.github/workflows/sync-upstream.yml' \
               -exec git rm -f --ignore-unmatch -- {} +
+            (cd libs/cua-driver/rust && cargo fmt --all) || true
           }
 
           # ====================================================================
-          # 阶段 1：若存在 Git 文本冲突，先由 agy 完成代码融合提交
+          # 阶段 1：若存在 Git 文本冲突，先由 agy 完成代码融合（不跑耗时子进程，外层统一格式化与测试）
           # ====================================================================
           if [[ "${MERGE_STATUS}" == "conflict" ]]; then
             {
               echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。"
-              echo "当前机器已安装完整 Rust 工具链（cargo / rustfmt / clippy，已开启 sccache 缓存）及 Linux 桌面依赖库。"
-              echo "请严格按以下步骤操作："
-              echo "1. 运行 git status 查看所有处于未合并冲突状态（UU/AA/DU/UD）的文件；"
-              echo "2. 阅读冲突文件的完整上下文，通过 git log MERGE_HEAD -n 15 -- <冲突文件> 理解官方最新改动意图，同时通过 git log HEAD -n 15 -- <冲突文件> 理解本分支（Linux Wayland 与 cua-perception 定制）的改动意图，谨慎融合双方逻辑；"
-              echo "3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何 .yml/.yaml 工作流文件；"
-              echo "4. 在 libs/cua-driver/rust 下运行 cargo fmt --all 格式化代码，并运行 git diff --check 确保无任何残留冲突标记；"
-              echo "5. 使用 git add 暂存已解决的冲突文件，并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\" 完成合并提交；"
-              echo "6. 用清晰的中文逐个文件简要说明冲突原因以及你的融合解决方式。"
+              echo "请专注完成代码融合，不要在子命令中运行 cargo build / cargo clippy / cargo test（外层流水线会在你退出后立即自动执行 cargo fmt 与全套 5 层编译回归验证）："
+              echo "1. 运行 git status 查看所有未合并冲突文件（UU/AA/DU/UD）；"
+              echo "2. 阅读冲突文件上下文，结合 git log MERGE_HEAD -n 15 -- <冲突文件> 与 git log HEAD -n 15 -- <冲突文件> 理解上游与本分支（Linux Wayland / cua-perception 定制）双方意图，准确融合逻辑；"
+              echo "3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何工作流文件；"
+              echo "4. 运行 git diff --check 确保无残留冲突标记，然后 git add 已解决文件并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\"；"
+              echo "5. 用简明中文逐个文件说明冲突原因与融合方式。"
             } > /tmp/agy_conflict_prompt.txt
 
             invoke_agy_with_prompt "$(cat /tmp/agy_conflict_prompt.txt)"
@@ -602,9 +625,10 @@ jobs:
               exit 1
             fi
 
-            clean_extra_workflows
+            clean_extra_workflows_and_format
 
             if [[ -f .git/MERGE_HEAD ]]; then
+              git add -u
               while IFS= read -r cf; do
                 if [[ -n "$cf" && -e "$cf" ]]; then
                   git add -- "$cf"
@@ -613,7 +637,8 @@ jobs:
               if [[ -z "$(git diff --name-only --diff-filter=U)" ]]; then
                 git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
               fi
-            elif ! git diff --cached --quiet; then
+            elif ! git diff --quiet || ! git diff --cached --quiet; then
+              git add -u
               git commit --amend --no-edit
             fi
 
@@ -622,12 +647,11 @@ jobs:
               exit 1
             fi
 
-            AI_LOG_SECTIONS="#### 1. Git 冲突融合说明"$'\n'"${SUMMARY}"
+            AI_LOG_SECTIONS="#### Git 冲突融合说明"$'\n'"${SUMMARY}"
           fi
 
           # ====================================================================
-          # 阶段 2：统一的「5 层双向编译测试 -> AI 自动修复 -> 重跑验证」多轮自愈闭环
-          # 无论 Git 合并是否有文本冲突，都必须通过全部 5 层测试！
+          # 阶段 2：统一的「5 层确定性编译测试 -> 内联报错交由 AI 秒级改码 -> 外层自动格式化并重跑」多轮自愈闭环
           # ====================================================================
           REPAIR_ROUND=0
           VERIFIED_OK="false"
@@ -648,23 +672,25 @@ jobs:
             REPAIR_ROUND=$((REPAIR_ROUND + 1))
             echo "⚠️ Verification failed! Starting automated AI self-healing round ${REPAIR_ROUND}/${MAX_REPAIR_ROUNDS}..."
 
+            FAILURE_EXCERPT=$(head -n 200 /tmp/verify_failure.log)
             {
               echo "当前分支在同步上游 main (${UPSTREAM_SHORT}) 后运行 5 层双向编译与回归测试未通过（第 ${REPAIR_ROUND}/${MAX_REPAIR_ROUNDS} 轮自动修复）。"
-              echo "关键错误摘要已提取在 /tmp/verify_failure.log，完整原始日志在 /tmp/verify_step_raw.log。"
               echo ""
-              echo "请严格遵循以下工程准则完成自动修复："
-              echo "1. 先阅读 /tmp/verify_failure.log（必要时查看 /tmp/verify_step_raw.log）定位所有编译错误、rustfmt 格式差异、Clippy (-D warnings) 告警或单元/桌面回归测试失败的根因；"
-              echo "2. 结合 git log -n 10 理解上游改动（如 Rust 编译器升级、签名变更、行为契约调整）与本仓库定制改动（Wayland 窗口裁剪/拖拽/焦点、浏览器现有 Profile CDP 绑定、cua-perception 无损与批处理推理、AT-SPI 按钮回退）的双方意图，做最小且地道的代码修复；"
-              echo "3. 【红线约束】严禁删除、注释或 #[ignore] 任何现有测试用例，严禁弱化测试断言，严禁在文件/模块顶部粗暴添加 #![allow(...)] 掩盖问题；"
-              echo "4. 【本地自检】当前环境已配置好 cargo / clippy / rustfmt 与 sccache 缓存，请在完成修改后直接在 libs/cua-driver/rust 目录下运行针对性的检查命令（例如 cargo fmt --all 以及报错对应的 cargo clippy --locked -p <crate> --all-targets -- -D warnings 或 cargo test --locked -p <crate>），确认零报错后再结束；"
-              echo "5. 严禁修改或新增 .github/workflows/ 下的工作流文件；"
-              echo "6. 用清晰的中文简要说明本轮发现的问题根因及修复方案。"
+              echo "以下是外层流水线捕获的精确编译 / Clippy / 测试报错摘要："
+              echo "================================================================================"
+              printf '%s\n' "${FAILURE_EXCERPT}"
+              echo "================================================================================"
+              echo ""
+              echo "请严格遵循以下职责边界快速完成源码修复："
+              echo "1. 直接阅读仓库内的对应源码文件（不要读取 /tmp 外部目录，也**不要**在终端子命令里执行耗时的 cargo build / cargo clippy / cargo test —— 外层流水线会在你返回后立即自动执行 cargo fmt --all 并重跑全套 5 层测试，若还有深层问题会自动进入下一轮反馈给你）；"
+              echo "2. 结合上下文同时保护上游最新改动与本分支定制能力（Wayland 窗口裁剪/拖拽/焦点、浏览器现有 Profile CDP 绑定、cua-perception 无损与批处理推理、AT-SPI 按钮回退），做最小、地道的等价代码修复；"
+              echo "3. 【红线约束】严禁删除、注释或 #[ignore] 任何测试用例，严禁弱化测试断言，严禁添加文件级 #![allow(...)] 掩盖告警，严禁修改 .github/workflows/；"
+              echo "4. 完成文件编辑保存即可（外层会自动执行 cargo fmt 与 git commit），最后用简明中文总结本轮修复的问题根因与改动点。"
             } > /tmp/agy_heal_prompt.txt
 
             invoke_agy_with_prompt "$(cat /tmp/agy_heal_prompt.txt)"
-            clean_extra_workflows
+            clean_extra_workflows_and_format
 
-            # 将 AI 自愈产生的工作区改动提交到本地分支
             if ! git diff --quiet || ! git diff --cached --quiet; then
               git add -u
               if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
@@ -695,42 +721,42 @@ jobs:
           fi
 
           # ====================================================================
-          # 阶段 3：全部 5 层测试 100% 通过！按状态自动发布 / 更新 PR / 合入
+          # 阶段 3：全部 5 层测试 100% 通过！按状态自动发布 / 更新 PR / 清理过期旧 PR 与告警
           # ====================================================================
           FINAL_SHA=$(git rev-parse HEAD)
 
-          # 情况 1：修复了已存在的待审 PR（如之前未通过测试的 auto-sync PR）
           if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
             git push origin "HEAD:refs/heads/${EXISTING_PR_REF}"
             post_commit_status "${FINAL_SHA}" "success" "Auto-healed (${REPAIR_ROUND} round(s)) & all 5 test layers passed"
             upsert_pr_verify_comment "${EXISTING_PR_NUM}" "${AI_LOG_SECTIONS}"
+            close_superseded_sync_prs "${EXISTING_PR_REF}" "PR #${EXISTING_PR_NUM}"
             close_stale_alert_issues "自动修复并验证通过现有 PR #${EXISTING_PR_NUM}：${EXISTING_PR_URL}"
             echo "Successfully healed and verified existing PR #${EXISTING_PR_NUM} (${EXISTING_PR_URL})!"
             exit 0
           fi
 
-          # 情况 2：Git 无文本冲突 且 第 0 轮一次全绿（零 AI 代码改动）—— 直接安全推入主分支
           if [[ "${MERGE_STATUS}" == "merged_cleanly" && "${REPAIR_ROUND}" -eq 0 ]]; then
             git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
             post_commit_status "${FINAL_SHA}" "success" "Clean merge verified: all 5 compile, unit, Wayland & GTK3 AT-SPI layers passed"
+            close_superseded_sync_prs "__merged_to_target__" "已直接合入 \`${TARGET_BRANCH}\`"
             close_stale_alert_issues "已无冲突合入 \`${TARGET_BRANCH}\` 并一次通过全部 5 层测试"
             echo "Clean merge passed all 5 layers on first run and was pushed to ${TARGET_BRANCH}!"
             exit 0
           fi
 
-          # 情况 3：存在 Git 冲突，或虽无 Git 冲突但触发了“语义/编译/测试自愈”（产生了 AI 适配代码）
           if [[ "${MERGE_STATUS}" == "merged_cleanly" ]]; then
             PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并自动修复编译/测试兼容问题"
             PR_INTRO="上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHA}\` 在 Git 文本层面无冲突，但 **5 层双向测试拦截到了跨侧编译/Clippy/功能兼容问题**，已由 **Antigravity CLI (\`agy\`)** 自动完成自愈修复并通过全部测试："
           else
             PR_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并自动解决冲突与测试验证"
-            PR_INTRO="上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHA}\` 合并到 \`${TARGET_BRANCH}\` 时出现冲突，已由 **Antigravity CLI (\`agy\`)** 自动完成代码融合并通过全部 5 层双向回归测试："
+            PR_INTRO="上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHA}\` 合并到 \`${TARGET_BRANCH}\` 时出现冲突，已由 **Antigravity CLI (\`agy\`)** 自动完成代码融合与自愈修复，并通过全部 5 层双向回归测试："
           fi
 
           RESULT_REF=""
           if [[ "${AUTO_MERGE_INPUT}" == "true" || "${AUTO_MERGE_VAR}" == "true" ]]; then
             git push origin "HEAD:refs/heads/${TARGET_BRANCH}"
             post_commit_status "${FINAL_SHA}" "success" "All 5 layers passed after automated conflict/test resolution"
+            close_superseded_sync_prs "__merged_to_target__" "已自动合入 \`${TARGET_BRANCH}\`"
             echo "Auto-merged verified changes directly into ${TARGET_BRANCH}!"
             RESULT_REF="已通过全部 5 层测试并直接自动合并至 \`${TARGET_BRANCH}\`"
           else
@@ -768,10 +794,19 @@ jobs:
               '{title: $title, head: $head, base: $base, body: $body}' \
               | gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" --input - --jq '.html_url')
             echo "Created verified sync PR: ${PR_URL}"
+            close_superseded_sync_prs "${PR_BRANCH}" "${PR_URL}"
             RESULT_REF="已创建通过全部 5 层测试的同步 PR：${PR_URL}"
           fi
 
           close_stale_alert_issues "${RESULT_REF}"
+
+      - name: Save Rust sccache
+        if: always() && steps.rust_cache.outputs.save == 'true'
+        uses: ./.github/actions/rust-cache-save
+        with:
+          key: ${{ steps.rust_cache.outputs.key }}
+          dir: ${{ steps.rust_cache.outputs.dir }}
+          exact-hit: ${{ steps.rust_cache.outputs.exact-hit }}
 
   verify:
     name: Bidirectional Driver & Perception Regression Suite
@@ -846,10 +881,12 @@ jobs:
           rustup toolchain install "${TOOLCHAIN}" --profile minimal --component rustfmt --component clippy
 
       - name: Configure Rust sccache
+        id: rust_cache
         uses: ./.github/actions/rust-cache
         with:
           workspaces: "libs/cua-driver/rust -> target"
           pr-save: "true"
+          save-always: "true"
 
       - name: Install Linux build and headless desktop dependencies
         uses: ./.github/actions/apt-install
@@ -928,3 +965,11 @@ jobs:
           fi
 
           exit "${VERIFY_RC}"
+
+      - name: Save Rust sccache
+        if: always() && steps.rust_cache.outputs.save == 'true'
+        uses: ./.github/actions/rust-cache-save
+        with:
+          key: ${{ steps.rust_cache.outputs.key }}
+          dir: ${{ steps.rust_cache.outputs.dir }}
+          exact-hit: ${{ steps.rust_cache.outputs.exact-hit }}
