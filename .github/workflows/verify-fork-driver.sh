@@ -108,9 +108,9 @@ layer_1_fmt_and_graph() {
 }
 
 layer_2_clippy_and_features() {
-  cargo clippy --locked --workspace --all-targets -- -D warnings
-  cargo clippy --locked -p platform-linux --features portal-input,portal-capture --all-targets -- -D warnings
-  cargo check --locked -p cua-driver --features portal-input
+  cargo clippy --locked --workspace --all-targets --keep-going -- -D warnings
+  cargo clippy --locked -p platform-linux --features portal-input,portal-capture --all-targets --keep-going -- -D warnings
+  cargo check --locked -p cua-driver --features portal-input --keep-going
 }
 
 layer_3_bidirectional_unit_tests() {

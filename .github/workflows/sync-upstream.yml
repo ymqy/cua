@@ -210,7 +210,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          MAX_REPAIR_ROUNDS=3
+          MAX_REPAIR_ROUNDS=6
           RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           VERTEX_PROXY_PID=""
           VERTEX_PROXY_PORT=""
