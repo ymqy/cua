@@ -287,6 +287,25 @@ class SyncInfraTests(unittest.TestCase):
             self.assertFalse((wf / "ci.yml").exists())
             self.assertFalse((wf / "release.yml").exists())
 
+    def test_write_agy_trusted_settings(self):
+        lib_path = WF_DIR / "agy-sync-lib.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            env = os.environ.copy()
+            env["HOME"] = tmp
+            subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'source {shlex.quote(str(lib_path))} && write_agy_trusted_settings /ws/main /ws/probe',
+                ],
+                env=env,
+                check=True,
+            )
+            settings_file = Path(tmp) / ".gemini" / "antigravity-cli" / "settings.json"
+            data = json.loads(settings_file.read_text(encoding="utf-8"))
+            self.assertEqual(data["modelProvider"], "gemini")
+            self.assertEqual(data["trustedWorkspaces"], ["/ws/main", "/ws/probe"])
+
     def test_vertex_proxy_policy_sanitization_429_and_broken_pipe(self):
         upstream = _MockVertexUpstream()
         with tempfile.TemporaryDirectory() as tmp:

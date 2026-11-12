@@ -119,11 +119,12 @@ write_agy_trusted_settings() {
   local workspace_dir="$1"
   shift
   mkdir -p "$HOME/.gemini/antigravity-cli"
+  local tmp_settings="$HOME/.gemini/antigravity-cli/settings.json.tmp"
   jq -n \
     --arg ws "${workspace_dir}" \
-    --ARGS.positional \
     '{modelProvider: "gemini", trustedWorkspaces: ([$ws] + $ARGS.positional)}' \
-    -- "$@" > "$HOME/.gemini/antigravity-cli/settings.json"
+    --args -- "$@" > "${tmp_settings}" || return 1
+  mv -f "${tmp_settings}" "$HOME/.gemini/antigravity-cli/settings.json"
 }
 
 install_agy_cli() {

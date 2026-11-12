@@ -99,7 +99,7 @@ jobs:
           echo "✅ Negative model gate confirmed: disallowed model rejected in <1s (rc=${NEG_RC})."
 
       - name: "[3/4] Live Vertex AI dual-model connectivity & quota probe (Argon + 3.8 Flash)"
-        if: ${{ inputs.live_vertex_probe != false }}
+        if: github.event_name != 'workflow_dispatch' || inputs.live_vertex_probe == true
         env:
           VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
           VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
@@ -113,7 +113,7 @@ jobs:
           python3 "${SYNC_BIN_DIR}/vertex-proxy.py" --probe-vertex --models "gemini-4-argon,gemini-3.8-flash"
 
       - name: "[4/4] Live micro Git-conflict auto-heal smoke test via agy + Vertex proxy"
-        if: ${{ inputs.live_vertex_probe != false }}
+        if: github.event_name != 'workflow_dispatch' || inputs.live_vertex_probe == true
         env:
           VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
           VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
