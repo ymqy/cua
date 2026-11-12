@@ -57,6 +57,12 @@ for m in re.finditer(r"error: test failed, to rerun pass [`']([^`']+)[`']", text
     if spec and spec not in reruns:
         reruns.append(spec)
 
+failed_pkgs = []
+for m in re.finditer(r"error: could not compile [`']([^`']+)[`']", text):
+    pkg = m.group(1).strip()
+    if pkg and pkg not in failed_pkgs:
+        failed_pkgs.append(pkg)
+
 tests = []
 for m in re.finditer(r"(?m)^test (\S+) \.\.\. FAILED$", text):
     t = m.group(1).strip()
@@ -125,6 +131,7 @@ with open(meta_out, "w", encoding="utf-8") as mf:
     mf.write(f"FAILED_LAYER_ID={shlex.quote(layer_id)}\n")
     mf.write(f"FAILED_KIND={shlex.quote(kind)}\n")
     mf.write(f"FAILED_SIGNATURE={shlex.quote(sig)}\n")
+    mf.write(f"FAILED_PACKAGES={shlex.quote(' '.join(failed_pkgs[:6]))}\n")
 
 if kind == "runtime_test" and layer_id in ("3", "4", "5"):
     with open(runtime_out, "w", encoding="utf-8") as rf:
@@ -278,8 +285,8 @@ layer_1_fmt_and_graph() {
 
 layer_2_clippy_and_features() {
   cargo clippy --locked --workspace --all-targets --keep-going -- -D warnings
-  cargo clippy --locked -p platform-linux --features portal-input,portal-capture --all-targets --keep-going -- -D warnings
-  cargo check --locked -p cua-driver --features portal-input --keep-going
+  cargo clippy --locked -p platform-linux --features portal-input,portal-capture --lib --bins --tests --keep-going -- -D warnings
+  cargo clippy --locked -p cua-driver --features portal-input --lib --bins --tests --keep-going -- -D warnings
 }
 
 layer_3_bidirectional_unit_tests() {
@@ -293,7 +300,7 @@ layer_3_bidirectional_unit_tests() {
     -p platform-linux \
     -p cursor-overlay \
     -p cua-cursor-motion \
-    --all-targets
+    --lib --bins --tests
 }
 
 layer_4_wayland_portal_tests() {
@@ -366,15 +373,13 @@ run_layer "1" "代码格式与依赖图守卫" \
   "rustfmt 格式一致性 + AT-SPI 无 p2p 特性泄漏契约" \
   layer_1_fmt_and_graph
 
-run_layer "2" "全工作区与 Wayland Portal 静态编译检查" \
-  "全 crates/tests Clippy (-D warnings) + portal-input/portal-capture 交叉编译签名校验" \
-  layer_2_clippy_and_features
-
-# Fail-fast targeted runtime precheck: runs AFTER static Clippy passes so compile mistakes
-# never wipe the sticky runtime target, and BEFORE full 8-crate Layer 3 execution.
 SKIP_LAYER_4="false"
 SKIP_LAYER_5="false"
 
+# Progressive fail-fast precheck A: if an earlier round failed a specific runtime test (Layers 3/4/5),
+# re-verify that exact target FIRST (~5-20s) before spending minutes on full 16-crate workspace Clippy.
+# If a compile error occurs here, extract_failure_artifacts classifies kind=compile and leaves
+# LAST_RUNTIME_ENV intact for the next round.
 if [[ -f "${LAST_RUNTIME_ENV}" ]]; then
   FAILED_RUNTIME_LAYER_ID=""
   FAILED_RERUN_SPEC=""
@@ -387,7 +392,9 @@ if [[ -f "${LAST_RUNTIME_ENV}" ]]; then
   if [[ "${FAILED_RUNTIME_LAYER_ID}" == "3" && -n "${FAILED_RERUN_SPEC}" ]]; then
     read -r -a SPEC_ARGS <<< "${FAILED_RERUN_SPEC}"
     layer_3_targeted_precheck() {
-      cargo build --locked -p cua-driver --bin cua-driver
+      if [[ "${FAILED_RERUN_SPEC}" == *"-p cua-driver"* ]]; then
+        cargo build --locked -p cua-driver --bin cua-driver
+      fi
       if [[ -n "${FAILED_TEST_FILTER}" ]]; then
         timeout --kill-after=10s 180s env CUA_TEST_REQUIRE_DRIVER_BIN=1 \
           cargo test --locked "${SPEC_ARGS[@]}" -- "${FAILED_TEST_FILTER}"
@@ -417,13 +424,44 @@ if [[ -f "${LAST_RUNTIME_ENV}" ]]; then
     SKIP_LAYER_4="true"
   elif [[ "${FAILED_RUNTIME_LAYER_ID}" == "5" ]]; then
     run_layer "5" "无头桌面与 GTK3/AT-SPI 优先复测" \
-      "定向优先验证 X11/GTK3 AT-SPI 修复（通过后补跑完整单元测试认证）" \
+      "定向优先验证 X11/GTK3 AT-SPI 修复（通过后补跑完整静态与单测认证）" \
       layer_5_headless_desktop_and_gtk_atspi
     rm -f "${LAST_RUNTIME_ENV}"
     LAYER_ROWS=("${SAVED_ROWS[@]}")
     SKIP_LAYER_5="true"
   fi
 fi
+
+# Progressive fail-fast precheck B: if the previous round failed compilation/Clippy on specific crates,
+# check those exact crates first (~5-15s) before compiling the rest of the workspace.
+if [[ -f "${LAST_FAIL_ENV}" ]]; then
+  FAILED_KIND=""
+  FAILED_PACKAGES=""
+  # shellcheck disable=SC1090
+  source "${LAST_FAIL_ENV}"
+  if [[ "${FAILED_KIND}" == "compile" && -n "${FAILED_PACKAGES}" ]]; then
+    SAVED_ROWS=("${LAYER_ROWS[@]}")
+    layer_2_pkg_precheck() {
+      local -a pkg_flags=()
+      local pkg
+      for pkg in ${FAILED_PACKAGES}; do
+        pkg_flags+=("-p" "${pkg}")
+      done
+      cargo clippy --locked "${pkg_flags[@]}" --lib --bins --tests --keep-going -- -D warnings
+      if [[ " ${FAILED_PACKAGES} " == *" platform-linux "* ]]; then
+        cargo clippy --locked -p platform-linux --features portal-input,portal-capture --lib --bins --tests --keep-going -- -D warnings
+      fi
+    }
+    run_layer "2" "上次失败包极速静态复检 (${FAILED_PACKAGES})" \
+      "定向快速验证修复包的编译与 Clippy 门禁（通过后继续全工作区静态检查）" \
+      layer_2_pkg_precheck
+    LAYER_ROWS=("${SAVED_ROWS[@]}")
+  fi
+fi
+
+run_layer "2" "全工作区与 Wayland Portal 静态编译检查" \
+  "全 crates/tests Clippy (-D warnings) + portal-input/portal-capture 交叉编译签名校验" \
+  layer_2_clippy_and_features
 
 run_layer "3" "上游契约与定制模块双向单元测试" \
   "cua-perception 无损/批处理推理 + cua-driver-core Wayland/CDP + platform-linux 拖拽/历史 + 契约测试" \

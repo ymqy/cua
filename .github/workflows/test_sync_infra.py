@@ -553,6 +553,7 @@ class SyncInfraTests(unittest.TestCase):
             parsed_meta_b = parse_shell_env_file(meta_b)
             parsed_rt_still = parse_shell_env_file(rt_a)
             self.assertEqual(parsed_meta_b["FAILED_KIND"], "compile")
+            self.assertEqual(parsed_meta_b["FAILED_PACKAGES"], "platform-linux")
             self.assertEqual(
                 parsed_rt_still["FAILED_RERUN_SPEC"],
                 "-p platform-linux --lib",
@@ -567,6 +568,146 @@ class SyncInfraTests(unittest.TestCase):
                 f"Expected duplicate --all-targets diagnostic to be deduplicated:\n{dedup_section}",
             )
             self.assertIn("==== Raw Log Tail", digest_text)
+
+    def test_schedule_circuit_breaker_and_push_routing(self):
+        lib_path = WF_DIR / "agy-sync-lib.sh"
+
+        def check_skip(event: str, bodies: str, up_sha: str, st_sha: str) -> int:
+            cmd = (
+                f"source {shlex.quote(str(lib_path))} && "
+                f"should_skip_exhausted_schedule {shlex.quote(event)} {shlex.quote(bodies)} "
+                f"{shlex.quote(up_sha)} {shlex.quote(st_sha)}"
+            )
+            return subprocess.run(["bash", "-c", cmd]).returncode
+
+        issue_body = "Alert text\n<!-- cua-sync-exhausted: up111:st222 -->\n"
+        # Exact match on schedule -> skip (rc 0)
+        self.assertEqual(check_skip("schedule", issue_body, "up111", "st222"), 0)
+        # Upstream advanced -> must NOT skip (rc 1)
+        self.assertEqual(check_skip("schedule", issue_body, "up999", "st222"), 1)
+        # Target or Draft PR commit advanced -> must NOT skip (rc 1)
+        self.assertEqual(check_skip("schedule", issue_body, "up111", "st888"), 1)
+        # Manual workflow_dispatch -> must NEVER skip even on identical SHAs (rc 1)
+        self.assertEqual(check_skip("workflow_dispatch", issue_body, "up111", "st222"), 1)
+
+        sync_txt = (WF_DIR / "sync-upstream.yml").read_text(encoding="utf-8")
+        self.assertIn("'libs/cua-driver/rust/**'", sync_txt)
+        self.assertIn(
+            "if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.verify_ref == '')",
+            sync_txt,
+        )
+        self.assertIn(
+            "if: github.event_name == 'pull_request' || github.event_name == 'push' || inputs.verify_ref != ''",
+            sync_txt,
+        )
+
+    def test_cargo_lock_conflict_auto_resolve_and_reconcile(self):
+        lib_path = WF_DIR / "agy-sync-lib.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+
+            (repo / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["a", "b"]\nresolver = "2"\n', encoding="utf-8"
+            )
+            for crate in ("a", "b"):
+                (repo / crate / "src").mkdir(parents=True)
+                (repo / crate / "Cargo.toml").write_text(
+                    f'[package]\nname = "{crate}"\nversion = "0.1.0"\nedition = "2021"\n',
+                    encoding="utf-8",
+                )
+                (repo / crate / "src" / "lib.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+
+            has_cargo = subprocess.run(["bash", "-c", "command -v cargo"], capture_output=True).returncode == 0
+            if has_cargo:
+                subprocess.run(
+                    ["cargo", "generate-lockfile", "--manifest-path", str(repo / "Cargo.toml")],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+            else:
+                (repo / "Cargo.lock").write_text("# v3\nversion = 3\n", encoding="utf-8")
+
+            subprocess.run(["git", "add", "."], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=repo, check=True, capture_output=True)
+
+            # Fork adds dependency b -> a (updating Cargo.lock)
+            subprocess.run(["git", "checkout", "-b", "fork"], cwd=repo, check=True, capture_output=True)
+            (repo / "b" / "Cargo.toml").write_text(
+                '[package]\nname = "b"\nversion = "0.1.0"\nedition = "2021"\n[dependencies]\na = { path = "../a" }\n',
+                encoding="utf-8",
+            )
+            if has_cargo:
+                subprocess.run(
+                    ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(repo / "Cargo.toml")],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+            else:
+                (repo / "Cargo.lock").write_text("# fork lock\nversion = 3\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "fork dep"], cwd=repo, check=True, capture_output=True)
+
+            # Upstream bumps crate `a` to 0.2.0 AND touches `b` description so Cargo.lock has an overlapping hunk conflict!
+            subprocess.run(["git", "checkout", "main"], cwd=repo, check=True, capture_output=True)
+            (repo / "a" / "Cargo.toml").write_text(
+                '[package]\nname = "a"\nversion = "0.2.0"\nedition = "2021"\n',
+                encoding="utf-8",
+            )
+            (repo / "b" / "Cargo.toml").write_text(
+                '[package]\nname = "b"\nversion = "0.2.0"\nedition = "2021"\n',
+                encoding="utf-8",
+            )
+            if has_cargo:
+                subprocess.run(
+                    ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(repo / "Cargo.toml")],
+                    cwd=repo,
+                    check=True,
+                    capture_output=True,
+                )
+            else:
+                (repo / "Cargo.lock").write_text("# upstream lock\nversion = 3\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "upstream bump"], cwd=repo, check=True, capture_output=True)
+
+            # Merge main into fork: resolve b/Cargo.toml cleanly (keeping version 0.2.0 + dep on `a`) while Cargo.lock conflicts!
+            subprocess.run(["git", "checkout", "fork"], cwd=repo, check=True, capture_output=True)
+            subprocess.run(["git", "merge", "--no-commit", "--no-ff", "main"], cwd=repo, capture_output=True)
+            unmerged_before = subprocess.check_output(
+                ["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo, text=True
+            ).splitlines()
+            self.assertIn("Cargo.lock", unmerged_before)
+
+            # Simulate clean resolution of b/Cargo.toml (keeping both upstream 0.2.0 and fork dep `a`)
+            (repo / "b" / "Cargo.toml").write_text(
+                '[package]\nname = "b"\nversion = "0.2.0"\nedition = "2021"\n[dependencies]\na = { path = "../a" }\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "b/Cargo.toml"], cwd=repo, check=True)
+
+            subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f"source {shlex.quote(str(lib_path))} && auto_resolve_lockfile_conflicts && reconcile_rust_lockfiles Cargo.toml",
+                ],
+                cwd=repo,
+                check=True,
+            )
+
+            unmerged_after = subprocess.check_output(
+                ["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo, text=True
+            ).strip()
+            self.assertEqual(unmerged_after, "")
+            if has_cargo:
+                locked_check = subprocess.run(
+                    ["cargo", "metadata", "--locked", "--format-version", "1", "--manifest-path", str(repo / "Cargo.toml")],
+                    cwd=repo,
+                    capture_output=True,
+                )
+                self.assertEqual(locked_check.returncode, 0, "Cargo.lock must pass --locked after reconciliation!")
 
 
 if __name__ == "__main__":

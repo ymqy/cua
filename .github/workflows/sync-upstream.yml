@@ -4,6 +4,11 @@ on:
   schedule:
     # 每 6 小时自动检查并同步一次上游最新提交（避开整点队列高峰）
     - cron: '17 */6 * * *'
+  push:
+    branches:
+      - feat/wayland-with-perception-opt
+    paths:
+      - 'libs/cua-driver/rust/**'
   pull_request:
     branches:
       - feat/wayland-with-perception-opt
@@ -24,8 +29,8 @@ on:
         type: string
 
 concurrency:
-  group: sync-upstream-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (inputs.verify_ref != '' && format('verify-{0}', inputs.verify_ref)) || 'sync' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: sync-upstream-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || (github.event_name == 'push' && format('push-{0}', github.ref_name)) || (inputs.verify_ref != '' && format('verify-{0}', inputs.verify_ref)) || 'sync' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 permissions:
   contents: write
@@ -48,7 +53,7 @@ env:
 jobs:
   sync:
     name: Sync upstream/main with Closed-Loop Auto-Heal & Verification
-    if: github.event_name != 'pull_request' && inputs.verify_ref == ''
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.verify_ref == '')
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
@@ -63,6 +68,7 @@ jobs:
         id: merge_attempt
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
 
@@ -87,8 +93,13 @@ jobs:
 
           UPSTREAM_SHA=$(git rev-parse upstream/main)
           UPSTREAM_SHORT=$(git rev-parse --short upstream/main)
-          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
-          echo "upstream_short=${UPSTREAM_SHORT}" >> "$GITHUB_OUTPUT"
+          TARGET_SHA=$(git rev-parse "origin/${TARGET_BRANCH}")
+          TARGET_SHORT=$(git rev-parse --short "origin/${TARGET_BRANCH}")
+          {
+            echo "upstream_sha=${UPSTREAM_SHA}"
+            echo "upstream_short=${UPSTREAM_SHORT}"
+            echo "target_sha=${TARGET_SHA}"
+          } >> "$GITHUB_OUTPUT"
 
           # 2. 检查目标分支是否已包含最新 upstream/main（无更新时 ~5s 极速退出）
           git checkout -B "${TARGET_BRANCH}" "origin/${TARGET_BRANCH}"
@@ -98,7 +109,10 @@ jobs:
             exit 0
           fi
 
-          # 3. 检查本仓库是否已有针对当前最新上游 commit 的待合并 auto-sync PR
+          OPEN_ALERT_BODIES=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
+            --jq '[.[] | select(.title | startswith("⚠️ 自动同步")) | .body // ""] | join("\n")' 2>/dev/null || true)
+
+          # 3. 检查本仓库是否已有针对当前最新上游 commit 的待合并或检查点 auto-sync PR
           EXISTING_PR_JSON=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&base=${TARGET_BRANCH}&per_page=50" \
             --jq "[.[] | select(.head.ref | startswith(\"auto-sync/${UPSTREAM_SHORT}\"))][0] // empty" || true)
           if [[ -n "${EXISTING_PR_JSON}" ]]; then
@@ -106,6 +120,7 @@ jobs:
             EXISTING_PR_URL=$(jq -r '.html_url' <<<"${EXISTING_PR_JSON}")
             EXISTING_PR_REF=$(jq -r '.head.ref' <<<"${EXISTING_PR_JSON}")
             EXISTING_PR_SHA=$(jq -r '.head.sha' <<<"${EXISTING_PR_JSON}")
+            EXISTING_PR_DRAFT=$(jq -r '.draft // false' <<<"${EXISTING_PR_JSON}")
 
             VERIFIED_STATE=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${EXISTING_PR_SHA}/status" \
               --jq "[.statuses[] | select(.context == \"${VERIFY_STATUS_CONTEXT}\")][0].state // \"none\"" || echo "none")
@@ -116,7 +131,13 @@ jobs:
               exit 0
             fi
 
-            echo "Open sync PR #${EXISTING_PR_NUM} (${EXISTING_PR_REF}) has verification state '${VERIFIED_STATE}'; checking out for closed-loop auto-healing..."
+            if should_skip_exhausted_schedule "${EVENT_NAME}" "${OPEN_ALERT_BODIES}" "${UPSTREAM_SHA}" "${EXISTING_PR_SHA}"; then
+              echo "status=already_attempted_failed" >> "$GITHUB_OUTPUT"
+              echo "Scheduled run skipped: checkpoint PR #${EXISTING_PR_NUM} (${EXISTING_PR_SHA:0:8}) for upstream ${UPSTREAM_SHORT} already exhausted auto-heal. Push a commit or trigger workflow_dispatch to retry."
+              exit 0
+            fi
+
+            echo "Open sync PR #${EXISTING_PR_NUM} (${EXISTING_PR_REF}, draft=${EXISTING_PR_DRAFT}) has state '${VERIFIED_STATE}'; checking out for closed-loop auto-healing..."
             git fetch origin "${EXISTING_PR_REF}"
             git checkout -B "${EXISTING_PR_REF}" "origin/${EXISTING_PR_REF}"
             {
@@ -124,17 +145,26 @@ jobs:
               echo "existing_pr_num=${EXISTING_PR_NUM}"
               echo "existing_pr_ref=${EXISTING_PR_REF}"
               echo "existing_pr_url=${EXISTING_PR_URL}"
+              echo "existing_pr_draft=${EXISTING_PR_DRAFT}"
             } >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # 4. 尝试将 upstream/main 合并进目标分支（绝不直接推送！即使无文本冲突也必须先通过 5 层测试）
+          # 4. 定时触发幂等熔断：若完全相同的 (upstream_sha, target_sha) 已耗尽自动修复，跳过重复空烧
+          if should_skip_exhausted_schedule "${EVENT_NAME}" "${OPEN_ALERT_BODIES}" "${UPSTREAM_SHA}" "${TARGET_SHA}"; then
+            echo "status=already_attempted_failed" >> "$GITHUB_OUTPUT"
+            echo "Scheduled run skipped: pair ${UPSTREAM_SHORT}:${TARGET_SHORT} already exhausted auto-heal. Waiting for new commits or manual workflow_dispatch."
+            exit 0
+          fi
+
+          # 5. 尝试将 upstream/main 合并进目标分支（绝不直接推送！即使无文本冲突也必须先通过 5 层测试）
           git merge --no-commit --no-ff upstream/main || true
 
-          # 保护本分叉专有工作流文件，移除上游其它工作流
+          # 保护本分叉专有工作流文件，移除上游其它工作流；并对 Cargo.lock 冲突做确定性自动解冲
           prune_upstream_workflows
+          auto_resolve_lockfile_conflicts
 
-          # 5. 检查是否存在 Git 文本冲突
+          # 6. 检查是否仍存在真实源码/配置冲突
           UNMERGED=$(git diff --name-only --diff-filter=U || true)
           if [[ -z "${UNMERGED}" ]]; then
             git commit -m "Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}"
@@ -231,10 +261,12 @@ jobs:
           MERGE_STATUS: ${{ steps.merge_attempt.outputs.status }}
           UPSTREAM_SHORT: ${{ steps.merge_attempt.outputs.upstream_short }}
           UPSTREAM_SHA: ${{ steps.merge_attempt.outputs.upstream_sha }}
+          TARGET_SHA: ${{ steps.merge_attempt.outputs.target_sha }}
           CONFLICT_FILES: ${{ steps.merge_attempt.outputs.conflict_files }}
           EXISTING_PR_NUM: ${{ steps.merge_attempt.outputs.existing_pr_num }}
           EXISTING_PR_REF: ${{ steps.merge_attempt.outputs.existing_pr_ref }}
           EXISTING_PR_URL: ${{ steps.merge_attempt.outputs.existing_pr_url }}
+          EXISTING_PR_DRAFT: ${{ steps.merge_attempt.outputs.existing_pr_draft }}
         run: |
           set -euo pipefail
 
@@ -267,6 +299,7 @@ jobs:
           upsert_pr_verify_comment() {
             local pr_num="$1"
             local extra_notes="${2:-}"
+            local include_failure="${3:-false}"
             local marker="<!-- cua-fork-verify-report -->"
             {
               echo "${marker}"
@@ -274,7 +307,18 @@ jobs:
                 echo "### 🛠️ 自动测试自愈记录"
                 printf '%s\n\n' "${extra_notes}"
               fi
-              cat /tmp/verify_report.md
+              if [[ -f /tmp/verify_report.md ]]; then
+                cat /tmp/verify_report.md
+              fi
+              if [[ "${include_failure}" == "true" && -s /tmp/verify_failure.log ]]; then
+                echo ""
+                echo "<details><summary>展开查看剩余待修复错误摘要</summary>"
+                echo ""
+                echo "\`\`\`text"
+                head -n 160 /tmp/verify_failure.log
+                echo "\`\`\`"
+                echo "</details>"
+              fi
               echo ""
               echo "🔗 [查看完整 Actions 运行日志](${RUN_URL})"
             } > /tmp/pr_verify_comment.md
@@ -298,7 +342,7 @@ jobs:
               --jq ".[] | select((.head.ref | startswith(\"auto-sync/\")) and (.head.ref != \"${keep_branch}\")) | \"\(.number) \(.head.ref)\"" \
               | while read -r old_num old_ref; do
                   if [[ -n "${old_num}" ]]; then
-                    jq -n --arg body "🔄 上游已有更新且新同步结果已通过全部 5 层双向回归测试（${replacement_desc}），自动关闭此旧同步 PR 并清理分支 \`${old_ref}\`。" \
+                    jq -n --arg body "🔄 已有更新的同步结果取代此分支（${replacement_desc}），自动关闭旧同步 PR 并清理分支 \`${old_ref}\`。" \
                       '{body: $body}' \
                       | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${old_num}/comments" --input - >/dev/null || true
                     printf '{"state":"closed"}' \
@@ -324,10 +368,28 @@ jobs:
 
           notify_failure() {
             local reason="$1"
+            local record_exhausted="${2:-true}"
+            local checkpoint_sha="${3:-}"
+            local checkpoint_pr_url="${4:-}"
             local title="⚠️ 自动同步冲突或测试未通过需人工检查"
 
+            local existing_json existing_num prior_markers
+            existing_json=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
+              --jq '[.[] | select(.title | startswith("⚠️ 自动同步"))][0] // empty' 2>/dev/null || true)
+            existing_num=""
+            prior_markers=""
+            if [[ -n "${existing_json}" ]]; then
+              existing_num=$(jq -r '.number // empty' <<<"${existing_json}")
+              prior_markers=$(jq -r '.body // ""' <<<"${existing_json}" | grep -Eo '<!-- cua-sync-exhausted: [^>]+ -->' || true)
+            fi
+
             {
-              echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 同步到 \`${TARGET_BRANCH}\` 时，自动闭环（最多 ${MAX_REPAIR_ROUNDS} 轮编译/测试自愈，仅使用 Gemini 4 Argon + Gemini 3.8 Flash）未能完全修复所有问题，**已拦截推送以保护目标分支**。"
+              echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 同步到 \`${TARGET_BRANCH}\` 时，自动闭环（最多 ${MAX_REPAIR_ROUNDS} 轮编译/测试自愈，仅使用 Gemini 4 Argon + Gemini 3.8 Flash）未能完全修复所有问题，**已拦截直接合入以保护目标分支**。"
+              if [[ -n "${checkpoint_pr_url}" ]]; then
+                echo ""
+                echo "👉 **已保存自动融合与修复检查点 Draft PR**：${checkpoint_pr_url}"
+                echo "> 可直接在该 Draft PR 分支上补充修改，或手动触发 \`Sync Upstream Main\` (\`workflow_dispatch\`) 从此检查点断点续修（定时任务不会对同一已耗尽状态重复空烧配额）。"
+              fi
               echo ""
               echo "**失败原因**："
               echo "\`\`\`"
@@ -349,15 +411,28 @@ jobs:
               fi
               echo ""
               echo "**完整运行日志**：${RUN_URL}"
+              echo ""
+              {
+                if [[ -n "${prior_markers}" ]]; then
+                  printf '%s\n' "${prior_markers}"
+                fi
+                if [[ "${record_exhausted}" == "true" ]]; then
+                  if [[ -n "${TARGET_SHA:-}" ]]; then
+                    format_sync_exhausted_marker "${UPSTREAM_SHA}" "${TARGET_SHA}"
+                    echo ""
+                  fi
+                  if [[ -n "${checkpoint_sha}" ]]; then
+                    format_sync_exhausted_marker "${UPSTREAM_SHA}" "${checkpoint_sha}"
+                    echo ""
+                  fi
+                fi
+              } | sort -u
             } > /tmp/sync_issue_body.md
 
-            local existing_num
-            existing_num=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
-              --jq '.[] | select(.title | startswith("⚠️ 自动同步")) | .number' | head -n 1 || true)
             if [[ -n "${existing_num}" ]]; then
               jq -n --rawfile body /tmp/sync_issue_body.md '{body: $body}' \
-                | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${existing_num}/comments" --input - >/dev/null || true
-              echo "Updated existing alert issue #${existing_num}."
+                | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/${existing_num}" --input - >/dev/null || true
+              echo "Updated alert issue #${existing_num} body & circuit-breaker markers."
               return 0
             fi
 
@@ -371,7 +446,91 @@ jobs:
           sanitize_and_format_workspace() {
             prune_upstream_workflows
             git clean -fd -- ':!libs' ':!.github' >/dev/null 2>&1 || true
+            reconcile_rust_lockfiles \
+              "libs/cua-driver/rust/Cargo.toml" \
+              "libs/cua-spacesd/Cargo.toml" || true
             (cd libs/cua-driver/rust && cargo fmt --all) || true
+          }
+
+          publish_checkpoint_and_notify() {
+            local reason="$1"
+
+            # Discard any half-edited uncommitted working tree changes while keeping committed progress.
+            git checkout -- . >/dev/null 2>&1 || true
+            git clean -fd -- libs/ >/dev/null 2>&1 || true
+
+            if [[ -f .git/MERGE_HEAD ]] || has_remaining_conflict_markers; then
+              notify_failure "${reason}" "true" "" ""
+              return 0
+            fi
+
+            # If the final round regressed into a compile error while an earlier round compiled cleanly,
+            # roll back to BEST_COMPILING_SHA so the checkpoint Draft PR always compiles!
+            if [[ "${LAST_ROUND_KIND:-}" == "compile" && -n "${BEST_COMPILING_SHA:-}" ]]; then
+              echo "⏪ Restoring best compiling checkpoint ${BEST_COMPILING_SHA:0:12} before saving Draft PR..."
+              git reset --hard "${BEST_COMPILING_SHA}"
+            fi
+
+            local final_sha
+            final_sha=$(git rev-parse HEAD)
+
+            if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
+              git push origin "HEAD:refs/heads/${EXISTING_PR_REF}" || true
+              post_commit_status "${final_sha}" "failure" "Auto-heal paused (${REPAIR_ROUND} round(s)); manual check or re-run"
+              upsert_pr_verify_comment "${EXISTING_PR_NUM}" "${AI_LOG_SECTIONS}" "true"
+              notify_failure "${reason}" "true" "${final_sha}" "${EXISTING_PR_URL}"
+              return 0
+            fi
+
+            local pr_branch draft_title draft_url
+            pr_branch="auto-sync/${UPSTREAM_SHORT}-$(date -u +%Y%m%d-%H%M)"
+            draft_title="chore(sync): [WIP/需人工检查] 合并上游 main (${UPSTREAM_SHORT}) 自动修复检查点"
+
+            if git push -u origin "HEAD:refs/heads/${pr_branch}"; then
+              post_commit_status "${final_sha}" "failure" "Checkpoint saved (${REPAIR_ROUND} round(s)); manual check or re-run"
+              {
+                echo "## 🚧 自动同步与自愈检查点（需人工介入或断点续修）"
+                echo ""
+                echo "上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHA}\` 的合并冲突已清除并保存至此检查点分支，但经过 **${REPAIR_ROUND}** 轮双模型（\`Gemini 4 Argon\` + \`Gemini 3.8 Flash\`）自愈后仍有部分测试未通过："
+                echo ""
+                echo "- **原因**：${reason}"
+                echo "- **如何继续**：可直接在此分支补充修复提交（会自动触发 5 层验证），或手动触发 \`Sync Upstream Main\` 工作流从此检查点继续自动修复。"
+                if [[ -n "${AI_LOG_SECTIONS}" ]]; then
+                  echo ""
+                  echo "### AI 融合与自愈记录"
+                  printf '%s\n' "${AI_LOG_SECTIONS}"
+                fi
+                if [[ -f /tmp/verify_report.md ]]; then
+                  echo ""
+                  cat /tmp/verify_report.md
+                fi
+                if [[ -s /tmp/verify_failure.log ]]; then
+                  echo ""
+                  echo "### 剩余待修复错误摘要"
+                  echo "\`\`\`text"
+                  head -n 160 /tmp/verify_failure.log
+                  echo "\`\`\`"
+                fi
+                echo ""
+                echo "🔗 [查看完整 Actions 运行日志](${RUN_URL})"
+              } > /tmp/checkpoint_pr_body.md
+
+              draft_url=$(jq -n \
+                --arg title "${draft_title}" \
+                --arg head "${pr_branch}" \
+                --arg base "${TARGET_BRANCH}" \
+                --rawfile body /tmp/checkpoint_pr_body.md \
+                '{title: $title, head: $head, base: $base, body: $body, draft: true}' \
+                | gh api -X POST "repos/${GITHUB_REPOSITORY}/pulls" --input - --jq '.html_url' 2>/dev/null || true)
+
+              if [[ -n "${draft_url}" ]]; then
+                echo "Saved checkpoint Draft PR: ${draft_url}"
+                close_superseded_sync_prs "${pr_branch}" "检查点 Draft PR：${draft_url}"
+              fi
+              notify_failure "${reason}" "true" "${final_sha}" "${draft_url}"
+            else
+              notify_failure "${reason}" "true" "${final_sha}" ""
+            fi
           }
 
           # ====================================================================
@@ -385,7 +544,7 @@ jobs:
               echo "请严格遵循以下职责边界快速完成冲突文件融合："
               echo "1. 直接按冲突标记位置阅读上述冲突文件上下文，必要时用 git log MERGE_HEAD -n 10 -- <冲突文件> 与 git log HEAD -n 10 -- <冲突文件> 查看双方改动意图；"
               echo "2. 同时保留上游最新改进与本分支定制逻辑（Linux Wayland / cua-perception / AT-SPI 按钮回退），清除全部 <<<<<<< / ======= / >>>>>>> 冲突标记并保存文件；"
-              echo "3. **绝对禁止**在终端子命令中执行 cargo build / cargo clippy / cargo check / cargo test，也无需手动 git commit（外层流水线会在你返回后立即自动执行 cargo fmt、git add/commit 并进入 5 层回归测试闭环）；"
+              echo "3. **绝对禁止**在终端子命令中执行 cargo build / cargo clippy / cargo check / cargo test，也无需手动 git commit（外层流水线会在你返回后立即自动同步 Cargo.lock、执行 cargo fmt、git add/commit 并进入 5 层回归测试闭环）；"
               echo "4. 严禁修改或恢复 .github/workflows/ 下的工作流文件；最后用简明中文说明冲突原因与融合方式。"
             } > /tmp/agy_conflict_prompt.txt
 
@@ -394,7 +553,7 @@ jobs:
             fi
 
             if has_remaining_conflict_markers; then
-              notify_failure "agy 运行结束但工作区仍残留未清除的 Git 冲突标记。"
+              notify_failure "agy 运行结束但工作区仍残留未清除的 Git 冲突标记。" "true"
               exit 1
             fi
 
@@ -418,11 +577,25 @@ jobs:
             fi
 
             if [[ -f .git/MERGE_HEAD ]] || [[ -n "$(git diff --name-only --diff-filter=U)" ]]; then
-              notify_failure "agy 运行结束但仍存在未完成提交的合并状态。"
+              notify_failure "agy 运行结束但仍存在未完成提交的合并状态。" "true"
               exit 1
             fi
 
             AI_LOG_SECTIONS="#### Git 冲突融合说明"$'\n'"${SUMMARY}"
+          fi
+
+          # Pre-Round-0 deterministic Cargo.lock reconciliation (handles lockfiles auto-resolved
+          # during merge_attempt before rustup/cargo was installed, preventing --locked deadlocks).
+          reconcile_rust_lockfiles \
+            "libs/cua-driver/rust/Cargo.toml" \
+            "libs/cua-spacesd/Cargo.toml"
+          if ! git diff --quiet -- '*Cargo.lock' 'Cargo.lock' 2>/dev/null; then
+            git add -- '*Cargo.lock' 'Cargo.lock' 2>/dev/null || git add -u
+            if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
+              git commit -m "chore(sync): reconcile Cargo.lock with workspace manifests"
+            else
+              git commit --amend --no-edit
+            fi
           fi
 
           # ====================================================================
@@ -431,6 +604,8 @@ jobs:
           REPAIR_ROUND=0
           VERIFIED_OK="false"
           PREV_FAIL_SIG=""
+          LAST_ROUND_KIND=""
+          BEST_COMPILING_SHA=""
           CONSECUTIVE_COMPILE_FAILS=0
           SEEN_TREES=" $(git rev-parse 'HEAD^{tree}') "
           rm -f /tmp/verify_last_failure.env /tmp/verify_last_runtime_target.env
@@ -443,6 +618,17 @@ jobs:
               break
             fi
 
+            FAILED_KIND="runtime_test"
+            FAILED_SIGNATURE=""
+            if [[ -f /tmp/verify_last_failure.env ]]; then
+              # shellcheck disable=SC1091
+              source /tmp/verify_last_failure.env
+            fi
+            LAST_ROUND_KIND="${FAILED_KIND}"
+            if [[ "${FAILED_KIND}" == "runtime_test" ]]; then
+              BEST_COMPILING_SHA=$(git rev-parse HEAD)
+            fi
+
             if [[ "${REPAIR_ROUND}" -ge "${MAX_REPAIR_ROUNDS}" ]]; then
               echo "❌ Reached maximum auto-repair rounds (${MAX_REPAIR_ROUNDS}) without passing all 5 test layers." >&2
               break
@@ -451,26 +637,21 @@ jobs:
             NOW_EPOCH=$(date +%s)
             REMAINING_SECS=$(( SOFT_DEADLINE_EPOCH - NOW_EPOCH ))
             if [[ "${REMAINING_SECS}" -lt 660 ]]; then
-              echo "⏱️ Remaining soft budget (${REMAINING_SECS}s) is under 11m; stopping repair loop cleanly to preserve diagnostics and cache." >&2
-              notify_failure "接近作业超时安全水位（已完成 ${REPAIR_ROUND} 轮自愈，剩余 ${REMAINING_SECS}s），主动收敛退出以保留诊断报告与编译缓存。"
+              echo "⏱️ Remaining soft budget (${REMAINING_SECS}s) is under 11m; saving checkpoint and stopping cleanly." >&2
+              publish_checkpoint_and_notify "接近作业超时安全水位（已完成 ${REPAIR_ROUND} 轮自愈，剩余 ${REMAINING_SECS}s），已自动保存检查点并收敛退出。"
               exit 1
             fi
 
             if [[ "${PREFLIGHT_DONE}" != "true" ]]; then
               if ! preflight_ai_toolchain "true"; then
-                notify_failure "AI 工具链或双模型（Gemini 4 Argon / Gemini 3.8 Flash）预检未通过。"
+                # Transient preflight error: do NOT mark SHA pair exhausted so next cron retries!
+                notify_failure "AI 工具链或双模型（Gemini 4 Argon / Gemini 3.8 Flash）预检未通过（将在下次调度自动重试）。" "false"
                 exit 1
               fi
               PREFLIGHT_DONE="true"
             fi
 
             REPAIR_ROUND=$((REPAIR_ROUND + 1))
-            FAILED_KIND="runtime_test"
-            FAILED_SIGNATURE=""
-            if [[ -f /tmp/verify_last_failure.env ]]; then
-              # shellcheck disable=SC1091
-              source /tmp/verify_last_failure.env
-            fi
 
             if [[ "${FAILED_KIND}" == "compile" ]]; then
               CONSECUTIVE_COMPILE_FAILS=$((CONSECUTIVE_COMPILE_FAILS + 1))
@@ -497,13 +678,14 @@ jobs:
               echo "================================================================================"
               echo ""
               echo "请严格遵循以下职责边界快速完成源码修复："
-              echo "1. 直接根据报错行号按行区间精准阅读仓库内的对应源码文件与 git log 上下文（遇到数千行的大文件时务必只按行号区间或符号搜索定位，不要逐段通读全文；不要读取 /tmp 外部目录，也**绝对禁止**在终端子命令里执行 cargo build / cargo clippy / cargo check / cargo test —— 外层流水线会在你返回后立即自动执行 cargo fmt --all 并按定向优先顺序复测全套 5 层回归，若还有深层问题会自动进入下一轮反馈给你）；"
+              echo "1. 直接根据报错行号按行区间精准阅读仓库内的对应源码文件与 git log 上下文（遇到数千行的大文件时务必只按行号区间或符号搜索定位，不要逐段通读全文；不要读取 /tmp 外部目录，也**绝对禁止**在终端子命令里执行 cargo build / cargo clippy / cargo check / cargo test —— 外层流水线会在你返回后立即自动同步 Cargo.lock、执行 cargo fmt --all 并按定向优先顺序极速复测，若还有深层问题会自动进入下一轮反馈给你）；"
               echo "2. 结合上下文同时保护上游最新改动与本分支定制能力（Wayland 窗口裁剪/拖拽/焦点、浏览器现有 Profile CDP 绑定、cua-perception 无损与批处理推理、AT-SPI 按钮回退），做最小、地道的等价代码修复；"
               echo "3. 【红线约束】严禁删除、注释或 #[ignore] 任何测试用例，严禁弱化测试断言，严禁添加文件级 #![allow(...)] 掩盖告警，严禁修改 .github/workflows/；"
               echo "4. 完成文件编辑保存即可（外层会自动执行 cargo fmt 与 git commit），最后用简明中文总结本轮修复的问题根因与改动点。"
             } > /tmp/agy_heal_prompt.txt
 
-            if ! invoke_agy_with_prompt "$(cat /tmp/agy_heal_prompt.txt)" "${HEAL_TIER}" "true" notify_failure; then
+            if ! invoke_agy_with_prompt "$(cat /tmp/agy_heal_prompt.txt)" "${HEAL_TIER}" "true"; then
+              publish_checkpoint_and_notify "第 ${REPAIR_ROUND} 轮 agy 双模型调用（Gemini 4 Argon + Gemini 3.8 Flash）未完成有效修复。"
               exit 1
             fi
             sanitize_and_format_workspace
@@ -538,11 +720,7 @@ jobs:
           fi
 
           if [[ "${VERIFIED_OK}" != "true" ]]; then
-            FINAL_SHA=$(git rev-parse HEAD)
-            if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
-              post_commit_status "${FINAL_SHA}" "failure" "Auto-heal exhausted ${MAX_REPAIR_ROUNDS} rounds; manual inspection required"
-            fi
-            notify_failure "经过 ${MAX_REPAIR_ROUNDS} 轮 AI 自动修复（Gemini 4 Argon + Gemini 3.8 Flash）后，5 层双向编译与回归测试仍未完全通过。"
+            publish_checkpoint_and_notify "经过 ${MAX_REPAIR_ROUNDS} 轮 AI 自动修复（Gemini 4 Argon + Gemini 3.8 Flash）后，5 层双向编译与回归测试仍未完全通过。"
             exit 1
           fi
 
@@ -554,7 +732,13 @@ jobs:
           if [[ "${MERGE_STATUS}" == "heal_existing_pr" ]]; then
             git push origin "HEAD:refs/heads/${EXISTING_PR_REF}"
             post_commit_status "${FINAL_SHA}" "success" "Auto-healed (${REPAIR_ROUND} round(s)) & all 5 test layers passed"
-            upsert_pr_verify_comment "${EXISTING_PR_NUM}" "${AI_LOG_SECTIONS}"
+            if [[ "${EXISTING_PR_DRAFT:-false}" == "true" ]]; then
+              gh pr ready "${EXISTING_PR_NUM}" >/dev/null 2>&1 || true
+              CLEAN_TITLE="chore(sync): 合并上游 main (${UPSTREAM_SHORT}) 并自动完成自愈与测试验证"
+              jq -n --arg title "${CLEAN_TITLE}" '{title: $title}' \
+                | gh api -X PATCH "repos/${GITHUB_REPOSITORY}/pulls/${EXISTING_PR_NUM}" --input - >/dev/null || true
+            fi
+            upsert_pr_verify_comment "${EXISTING_PR_NUM}" "${AI_LOG_SECTIONS}" "false"
             close_superseded_sync_prs "${EXISTING_PR_REF}" "PR #${EXISTING_PR_NUM}"
             close_stale_alert_issues "自动修复并验证通过现有 PR #${EXISTING_PR_NUM}：${EXISTING_PR_URL}"
             echo "Successfully healed and verified existing PR #${EXISTING_PR_NUM} (${EXISTING_PR_URL})!"
@@ -636,7 +820,7 @@ jobs:
 
   verify:
     name: Bidirectional Driver & Perception Regression Suite
-    if: github.event_name == 'pull_request' || inputs.verify_ref != ''
+    if: github.event_name == 'pull_request' || github.event_name == 'push' || inputs.verify_ref != ''
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -652,6 +836,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
           VERIFY_REF_INPUT: ${{ inputs.verify_ref }}
@@ -670,6 +855,10 @@ jobs:
             git checkout --detach "${PR_HEAD_SHA}"
             TESTED_SHA=$(git rev-parse HEAD)
             PR_NUMBER="${PR_NUMBER_EVENT}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            git fetch origin "${PUSH_SHA}"
+            git checkout --detach "${PUSH_SHA}"
+            TESTED_SHA=$(git rev-parse HEAD)
           else
             git fetch origin "${VERIFY_REF_INPUT}" || true
             if git rev-parse --verify --quiet "origin/${VERIFY_REF_INPUT}^{commit}" >/dev/null; then

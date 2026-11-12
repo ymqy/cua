@@ -60,6 +60,79 @@ prune_upstream_workflows() {
   done < <(find .github/workflows -maxdepth 2 -type f \( -name '*.yml' -o -name '*.yaml' \) 2>/dev/null || true)
 }
 
+auto_resolve_lockfile_conflicts() {
+  # Resolve Cargo.lock Git conflicts deterministically using upstream (--theirs) baseline
+  # so LLM tokens are never wasted hand-editing multi-thousand-line lockfiles & checksums.
+  # Call reconcile_rust_lockfiles once Cargo is available to sync lockfiles with Cargo.toml.
+  local lf
+  LOCKFILE_CONFLICTS_RESOLVED="${LOCKFILE_CONFLICTS_RESOLVED:-false}"
+  while IFS= read -r lf; do
+    [[ -z "${lf}" ]] && continue
+    if [[ "${lf}" == "Cargo.lock" || "${lf}" == */Cargo.lock ]]; then
+      if git checkout --theirs -- "${lf}" 2>/dev/null || git checkout --ours -- "${lf}" 2>/dev/null; then
+        git add -- "${lf}"
+        LOCKFILE_CONFLICTS_RESOLVED="true"
+        echo "🔒 Auto-resolved Cargo.lock conflict via deterministic baseline: ${lf}"
+      fi
+    fi
+  done < <(git diff --name-only --diff-filter=U || true)
+  export LOCKFILE_CONFLICTS_RESOLVED
+}
+
+reconcile_rust_lockfiles() {
+  # Minimally reconcile Cargo.lock when workspace Cargo.toml dependencies changed during merge/repair,
+  # preventing `--locked` verification deadlocks while keeping existing pinned versions intact.
+  if ! command -v cargo >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local manifest
+  for manifest in "$@"; do
+    [[ -z "${manifest}" || ! -f "${manifest}" ]] && continue
+    if cargo metadata --locked --format-version 1 --manifest-path "${manifest}" >/dev/null 2>&1; then
+      continue
+    fi
+    echo "🔄 Lockfile out of sync for ${manifest}; reconciling minimally via cargo metadata..."
+    if ! cargo metadata --format-version 1 --manifest-path "${manifest}" >/dev/null; then
+      echo "ERROR: Failed to reconcile Cargo.lock for ${manifest}." >&2
+      return 1
+    fi
+    cargo metadata --locked --format-version 1 --manifest-path "${manifest}" >/dev/null
+    echo "✅ Reconciled lockfile cleanly for ${manifest}."
+  done
+  return 0
+}
+
+format_sync_exhausted_marker() {
+  local upstream_sha="$1"
+  local state_sha="$2"
+  printf '<!-- cua-sync-exhausted: %s:%s -->' "${upstream_sha}" "${state_sha}"
+}
+
+should_skip_exhausted_schedule() {
+  # Returns 0 (skip) ONLY on scheduled runs when the exact (upstream_sha, state_sha) pair
+  # already exhausted automated healing. Manual workflow_dispatch or any SHA change returns 1 (run).
+  local event_name="$1"
+  local alert_bodies="$2"
+  local upstream_sha="$3"
+  local state_sha="$4"
+
+  if [[ "${event_name}" != "schedule" ]]; then
+    return 1
+  fi
+  if [[ -z "${upstream_sha}" || -z "${state_sha}" ]]; then
+    return 1
+  fi
+
+  local marker
+  marker=$(format_sync_exhausted_marker "${upstream_sha}" "${state_sha}")
+  if grep -Fq -- "${marker}" <<<"${alert_bodies}"; then
+    return 0
+  fi
+  return 1
+}
+
+
 stop_vertex_bridge() {
   if [[ -n "${VERTEX_PROXY_PID:-}" ]]; then
     kill "${VERTEX_PROXY_PID}" 2>/dev/null || true
