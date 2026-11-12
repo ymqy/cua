@@ -29,12 +29,9 @@ fn detect_cdp_port(pid: Option<u32>) -> Option<u16> {
             }
         }
     }
-    for port in [9223, 9222] {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return Some(port);
-        }
-    }
-    None
+    [9223, 9222]
+        .into_iter()
+        .find(|&port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok())
 }
 
 // ── set_window_frame (Linux) ─────────────────────────────────────────────────

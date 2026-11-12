@@ -4539,7 +4539,7 @@ fn enrich_native_windows(
         // Hardening for Chromium windows: ensure pid is main process and bounds are never zero.
         let is_chromium = window.app_name.to_lowercase().contains("chrom");
         if is_chromium {
-            let needs_main_pid = window.pid.map_or(true, |p| !is_main_browser_pid(p));
+            let needs_main_pid = window.pid.is_none_or(|p| !is_main_browser_pid(p));
             if needs_main_pid {
                 if let Some(c) = atspi.iter().find(|c| {
                     app_names_match(&c.app_name, &window.app_name)

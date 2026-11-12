@@ -81,7 +81,6 @@ impl Tool for SetValueTool {
         };
         let idx = token.index;
         let value_for_task = value.clone();
-        let xid_opt = Some(xid);
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         let cursor_id = resolve_cursor_key(&args);
         position_named_session_keyboard_cursor(
@@ -168,9 +167,9 @@ impl Tool for SetValueTool {
             foreground_budget(value.len()),
             move || -> anyhow::Result<Option<crate::input::FocusGuardReport>> {
                 if wayland_route {
-                    let coords = resolve_element_local_coords(pid, &target, xid_opt).ok();
-                    let (win, lx, ly) = coords.unwrap_or_else(|| (xid_opt.unwrap_or(0), 0.0, 0.0));
-                    let xid = if win != 0 { win } else { xid_opt.unwrap_or(0) };
+                    let coords = resolve_element_local_coords(pid, &target, Some(xid)).ok();
+                    let (win, lx, ly) = coords.unwrap_or((xid, 0.0, 0.0));
+                    let xid = if win != 0 { win } else { xid };
                     crate::interaction::with_target_foreground(
                         pid,
                         xid,
@@ -197,7 +196,7 @@ impl Tool for SetValueTool {
                     )?;
                     return Ok(None);
                 }
-                let (win, lx, ly) = resolve_element_local_coords(pid, &target, xid_opt)?;
+                let (win, lx, ly) = resolve_element_local_coords(pid, &target, Some(xid))?;
                 if is_combo {
                     return pick_from_popup(
                         &cursor_id,

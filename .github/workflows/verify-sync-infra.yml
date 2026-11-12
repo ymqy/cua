@@ -1,0 +1,195 @@
+name: Verify Sync Infra
+
+on:
+  workflow_dispatch:
+    inputs:
+      live_vertex_probe:
+        description: '是否使用 VERTEX_API_KEY 执行真实 Vertex AI 双模型 (Argon + 3.8 Flash) 连通性与最小冲突修复闭环验证'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - feat/wayland-with-perception-opt
+    paths:
+      - '.github/workflows/sync-upstream.yml'
+      - '.github/workflows/verify-sync-infra.yml'
+      - '.github/workflows/verify-fork-driver.sh'
+      - '.github/workflows/vertex-proxy.py'
+      - '.github/workflows/agy-sync-lib.sh'
+      - '.github/workflows/test_sync_infra.py'
+  pull_request:
+    branches:
+      - feat/wayland-with-perception-opt
+    paths:
+      - '.github/workflows/sync-upstream.yml'
+      - '.github/workflows/verify-sync-infra.yml'
+      - '.github/workflows/verify-fork-driver.sh'
+      - '.github/workflows/vertex-proxy.py'
+      - '.github/workflows/agy-sync-lib.sh'
+      - '.github/workflows/test_sync_infra.py'
+
+concurrency:
+  group: verify-sync-infra-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SYNC_BIN_DIR: /tmp/cua-sync-bin
+  AGY_CLI_DISABLE_AUTO_UPDATE: "true"
+
+jobs:
+  verify-foundation:
+    name: Verify Sync Scripts, Proxy, agy Models & Vertex AI (~1 min)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: "[1/4] Static lint & offline unit/mock suite (ShellCheck + Proxy + Parser + Workflow Pruning)"
+        run: |
+          set -euo pipefail
+
+          bash -n .github/workflows/agy-sync-lib.sh
+          bash -n .github/workflows/verify-fork-driver.sh
+          python3 -m py_compile .github/workflows/vertex-proxy.py .github/workflows/test_sync_infra.py
+
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -x .github/workflows/agy-sync-lib.sh .github/workflows/verify-fork-driver.sh
+          fi
+
+          python3 .github/workflows/test_sync_infra.py -v
+
+      - name: "[2/4] Install real agy CLI & verify strict 2-model registry (Argon + 3.8 Flash dry-run + negative gate)"
+        run: |
+          set -euo pipefail
+
+          # shellcheck source=.github/workflows/agy-sync-lib.sh
+          source .github/workflows/agy-sync-lib.sh
+          trap stop_vertex_bridge EXIT
+
+          stage_sync_scripts_to_dir "${SYNC_BIN_DIR}"
+          preflight_ai_toolchain "false"
+
+          # Negative assertion: confirm unknown/disallowed models fail immediately!
+          set +e
+          GEMINI_API_KEY="dryrun-key" \
+          GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${VERTEX_PROXY_PORT}/dryrun" \
+          NO_PROXY="127.0.0.1,localhost" \
+          no_proxy="127.0.0.1,localhost" \
+          agy -p "Reply OK" \
+            --settings '{"modelProvider":"gemini"}' \
+            --dangerously-skip-permissions \
+            --output-format json \
+            --print-timeout 15s \
+            --model "nonexistent-model-check" </dev/null >/tmp/neg_out.json 2>/tmp/neg_err.log
+          NEG_RC=$?
+          set -e
+
+          if [[ "${NEG_RC}" -eq 0 ]]; then
+            echo "ERROR: Disallowed model nonexistent-model-check unexpectedly succeeded!" >&2
+            exit 1
+          fi
+          echo "✅ Negative model gate confirmed: disallowed model rejected in <1s (rc=${NEG_RC})."
+
+      - name: "[3/4] Live Vertex AI dual-model connectivity & quota probe (Argon + 3.8 Flash)"
+        if: ${{ inputs.live_vertex_probe != false }}
+        env:
+          VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
+          VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${VERTEX_API_KEY:-}" ]]; then
+            echo "ERROR: VERTEX_API_KEY Secret is empty!" >&2
+            exit 1
+          fi
+          python3 "${SYNC_BIN_DIR}/vertex-proxy.py" --probe-vertex --models "gemini-4-argon,gemini-3.8-flash"
+
+      - name: "[4/4] Live micro Git-conflict auto-heal smoke test via agy + Vertex proxy"
+        if: ${{ inputs.live_vertex_probe != false }}
+        env:
+          VERTEX_API_KEY: ${{ secrets.VERTEX_API_KEY }}
+          VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+        run: |
+          set -euo pipefail
+
+          # shellcheck source=/dev/null
+          source "${SYNC_BIN_DIR}/agy-sync-lib.sh"
+          trap stop_vertex_bridge EXIT
+
+          SMOKE_REPO="/tmp/agy-micro-conflict-smoke"
+          rm -rf "${SMOKE_REPO}"
+          mkdir -p "${SMOKE_REPO}/libs"
+          cd "${SMOKE_REPO}"
+
+          git init -b main >/dev/null
+          git config user.name "Sync Infra Smoke"
+          git config user.email "22427967+ymqy@users.noreply.github.com"
+
+          cat <<'RS' > libs/greeting.rs
+          pub fn features() -> Vec<&'static str> {
+              vec!["core"]
+          }
+          RS
+          git add libs/greeting.rs
+          git commit -m "base" >/dev/null
+
+          git checkout -b fork-wayland >/dev/null
+          cat <<'RS' > libs/greeting.rs
+          pub fn features() -> Vec<&'static str> {
+              vec!["core", "wayland-perception"]
+          }
+          RS
+          git commit -am "fork feature" >/dev/null
+
+          git checkout main >/dev/null
+          cat <<'RS' > libs/greeting.rs
+          pub fn features() -> Vec<&'static str> {
+              vec!["core", "upstream-telemetry"]
+          }
+          RS
+          git commit -am "upstream feature" >/dev/null
+
+          git checkout fork-wayland >/dev/null
+          git merge --no-commit --no-ff main >/dev/null 2>&1 || true
+
+          export CONFLICT_FILES="libs/greeting.rs"
+          export AGY_EDIT_SCOPE="libs"
+
+          PROMPT="文件 libs/greeting.rs 存在 Git 合并冲突。请直接编辑保存 libs/greeting.rs，同时保留 'upstream-telemetry' 与 'wayland-perception' 两项，清除全部冲突标记，不要执行任何终端编译或 git commit 命令，最后简短回复已完成。"
+          invoke_agy_with_prompt "${PROMPT}" "fast" "true"
+
+          if has_remaining_conflict_markers; then
+            echo "ERROR: Conflict markers still present in libs/greeting.rs!" >&2
+            cat libs/greeting.rs >&2
+            exit 1
+          fi
+          grep -q "wayland-perception" libs/greeting.rs
+          grep -q "upstream-telemetry" libs/greeting.rs
+
+          HEALTH_JSON=$(curl -fsS "http://127.0.0.1:${VERTEX_PROXY_PORT}/healthz")
+          echo "Bridge telemetry: ${HEALTH_JSON}"
+          REJECTED_COUNT=$(jq -r '.stats.rejected_models | length' <<<"${HEALTH_JSON}")
+          if [[ "${REJECTED_COUNT}" -ne 0 ]]; then
+            echo "ERROR: Unexpected disallowed model calls recorded: ${HEALTH_JSON}" >&2
+            exit 1
+          fi
+
+          {
+            echo "### ✅ Sync 基础设施极速验证通过"
+            echo ""
+            echo "| 检查项 | 结果 | 说明 |"
+            echo "| :--- | :--- | :--- |"
+            echo "| **1. 静态语法与 Mock 单测** | ✅ 通过 | ShellCheck + 双模型白名单守卫 + BrokenPipe 零重试 + Cargo 反引号解析 + 工作流防误删 |"
+            echo "| **2. \`agy\` CLI 模型注册表预检** | ✅ 通过 | \`gemini-4-argon-high\` & \`gemini-3.8-flash-high\` 实测兼容，非法模型秒级拦截 |"
+            echo "| **3. Vertex AI 双模型实连探针** | ✅ 通过 | \`gemini-4-argon\` & \`gemini-3.8-flash\` 鉴权与配额正常 |"
+            echo "| **4. 最小 Git 冲突端到端闭环** | ✅ 通过 | 真实调用 \`invoke_agy_with_prompt\` 自动融合冲突文件并通过代理遥测校验 |"
+          } >> "$GITHUB_STEP_SUMMARY"

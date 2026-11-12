@@ -12,16 +12,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
+use cua_driver_core::history_keyring::KeyringKeyProvider;
+
 #[derive(Default)]
-pub struct LinuxSecretServiceKeyProvider {
-    inner: cua_driver_core::history_keyring::KeyringKeyProvider,
-}
+pub struct LinuxSecretServiceKeyProvider;
 
 impl LinuxSecretServiceKeyProvider {
     pub fn shared() -> Arc<Self> {
-        Arc::new(Self {
-            inner: cua_driver_core::history_keyring::KeyringKeyProvider,
-        })
+        Arc::new(Self)
     }
 
     fn fallback_key_dir() -> PathBuf {
@@ -81,7 +79,7 @@ impl LinuxSecretServiceKeyProvider {
 
 impl KeyProvider for LinuxSecretServiceKeyProvider {
     fn load_or_create(&self, namespace: &str) -> Result<HistoryKey, HistoryError> {
-        match self.inner.load_or_create(namespace) {
+        match KeyringKeyProvider.load_or_create(namespace) {
             Ok(key) => Ok(key),
             Err(_) => {
                 let path = Self::fallback_key_path(namespace);
@@ -116,7 +114,7 @@ impl KeyProvider for LinuxSecretServiceKeyProvider {
                 bytes,
             });
         }
-        match self.inner.load(namespace, reference) {
+        match KeyringKeyProvider.load(namespace, reference) {
             Ok(key) => Ok(key),
             Err(_) => {
                 let path = Self::fallback_key_path(namespace);
@@ -134,7 +132,7 @@ impl KeyProvider for LinuxSecretServiceKeyProvider {
     }
 
     fn references(&self, namespace: &str) -> Result<Vec<String>, HistoryError> {
-        let mut refs = self.inner.references(namespace).unwrap_or_default();
+        let mut refs = KeyringKeyProvider.references(namespace).unwrap_or_default();
         let path = Self::fallback_key_path(namespace);
         if path.is_file() {
             let file_ref = format!("file:{}", path.display());
@@ -146,7 +144,7 @@ impl KeyProvider for LinuxSecretServiceKeyProvider {
     }
 
     fn destroy(&self, namespace: &str, reference: &str) -> Result<(), HistoryError> {
-        let _ = self.inner.destroy(namespace, reference);
+        let _ = KeyringKeyProvider.destroy(namespace, reference);
         if let Some(path_str) = reference.strip_prefix("file:") {
             let path = PathBuf::from(path_str);
             let _ = fs::remove_file(path);
