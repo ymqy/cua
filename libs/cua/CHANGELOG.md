@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.25.2](https://github.com/trycua/cua/compare/cua-sdk-v0.25.1...cua-sdk-v0.25.2) (2026-11-12)
+
+
+### Bug Fixes
+
+* **vmm:** gate container-only code so cua-vmm builds with any backend feature set ([#7433](https://github.com/trycua/cua/issues/7433)) ([6637de4](https://github.com/trycua/cua/commit/6637de44fb669fea965ee0197ced5ac6a95cf11e))
+* **vmm:** skip resolv.conf removal for containers without one ([#7429](https://github.com/trycua/cua/issues/7429)) ([4a5f90b](https://github.com/trycua/cua/commit/4a5f90baf4478943f08c8b38724c7ee8b06d7667))
+
+## [0.25.1](https://github.com/trycua/cua/compare/cua-sdk-v0.25.0...cua-sdk-v0.25.1) (2026-11-12)
+
+
+### Bug Fixes
+
+* **spaces:** forward create_space CPU and memory limits ([#7428](https://github.com/trycua/cua/issues/7428)) ([f2201ac](https://github.com/trycua/cua/commit/f2201ac55ce19fb513c4b53569d04d2016bce4b8))
+
+## [0.25.0](https://github.com/trycua/cua/compare/cua-sdk-v0.24.2...cua-sdk-v0.25.0) (2026-11-12)
+
+
+### Features
+
+* **spaces:** setup shows each agent connection step live, connects Cua Driver and sets up This Mac (CUA-4067) ([#7389](https://github.com/trycua/cua/issues/7389)) ([d2c5abb](https://github.com/trycua/cua/commit/d2c5abbb3b4b4cbece4079ad59da74e99dc7b473))
+
+
+### Bug Fixes
+
+* **cua-vmm:** run the engine helper's chroot from PATH and build sandbox overlays on 24.04 ([#7409](https://github.com/trycua/cua/issues/7409)) ([10cd739](https://github.com/trycua/cua/commit/10cd739d46db34a0373245531c8219babf606c1f))
+
 ## [0.24.2](https://github.com/trycua/cua/compare/cua-sdk-v0.24.1...cua-sdk-v0.24.2) (2026-11-11)
 
 
