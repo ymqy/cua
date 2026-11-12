@@ -373,6 +373,7 @@ jobs:
           import re
           import sys
           import threading
+          import time
           import urllib.error
           import urllib.request
 
@@ -385,6 +386,7 @@ jobs:
 
           PATH_RE = re.compile(r"^/v1(?:beta1?)?/models/([^/:?]+):([^?]+)(?:\?(.*))?$")
           PROJ_ERR_RE = re.compile(r"projects/([^/`\"'\s]+)/locations/")
+          BACKOFF_SECS = (5, 10, 20, 35, 50)
 
 
           def build_vertex_url(model: str, action: str, query: str, project: str, location: str) -> str:
@@ -456,7 +458,8 @@ jobs:
                   if "Accept" in self.headers:
                       headers["Accept"] = self.headers["Accept"]
 
-                  for _attempt in range(3):
+                  retry_idx = 0
+                  for _attempt in range(8):
                       url = build_vertex_url(model, action, query, project, location)
                       req = urllib.request.Request(url, data=body, headers=headers, method="POST")
                       try:
@@ -489,9 +492,21 @@ jobs:
                               if patched is not None:
                                   body = patched
                                   continue
+                          if e.code in (429, 500, 502, 503, 504) and retry_idx < len(BACKOFF_SECS):
+                              wait_s = BACKOFF_SECS[retry_idx]
+                              retry_idx += 1
+                              sys.stderr.write(f"[vertex_proxy] HTTP {e.code} on {model}; sleeping {wait_s}s before retry {retry_idx}...\n")
+                              sys.stderr.flush()
+                              time.sleep(wait_s)
+                              continue
                           self._send_error_json(e.code, err_body)
                           return
                       except Exception as e:
+                          if retry_idx < len(BACKOFF_SECS):
+                              wait_s = BACKOFF_SECS[retry_idx]
+                              retry_idx += 1
+                              time.sleep(wait_s)
+                              continue
                           msg = json.dumps({"error": {"code": 502, "message": f"Vertex proxy upstream error: {e}"}}).encode()
                           self._send_error_json(502, msg)
                           return
@@ -554,10 +569,14 @@ jobs:
             set +e
             run_once --effort high
             local agy_rc=$?
-            if [[ $agy_rc -ne 0 ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|model' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
-              echo "Default model returned access/quota error; retrying with gemini-3.8-flash-high..."
+            local json_status
+            json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
+            if [[ $agy_rc -ne 0 || "${json_status}" != "SUCCESS" ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|503|overloaded|model' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
+              echo "Default model hit quota/429 or model access error; sleeping 15s and retrying with gemini-3.8-flash-high..."
+              sleep 15
               run_once --model gemini-3.8-flash-high
               agy_rc=$?
+              json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
             fi
             set -e
 
