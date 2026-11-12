@@ -38,17 +38,23 @@ run_layer() {
   echo "  覆盖范围: ${layer_scope}"
   echo "================================================================================"
 
-  local t0 t1 elapsed rc
+  local t0 t1 elapsed rc tail_pid
   t0=$(date +%s)
   : > "${RAW_LOG}"
+  tail -n +1 -f "${RAW_LOG}" &
+  tail_pid=$!
 
   set +e
   (
     set -euo pipefail
     "$@"
-  ) 2>&1 | tee "${RAW_LOG}"
-  rc=${PIPESTATUS[0]}
+  ) > "${RAW_LOG}" 2>&1
+  rc=$?
   set -e
+
+  sleep 0.2
+  kill "${tail_pid}" 2>/dev/null || true
+  wait "${tail_pid}" 2>/dev/null || true
 
   t1=$(date +%s)
   elapsed=$((t1 - t0))
@@ -115,7 +121,7 @@ layer_2_clippy_and_features() {
 
 layer_3_bidirectional_unit_tests() {
   cargo build --locked -p cua-driver --bin cua-driver
-  CUA_TEST_REQUIRE_DRIVER_BIN=1 cargo test --locked \
+  timeout --kill-after=15s 900s env CUA_TEST_REQUIRE_DRIVER_BIN=1 cargo test --locked \
     -p cua-driver \
     -p cua-driver-core \
     -p cua-driver-contract \
@@ -128,29 +134,67 @@ layer_3_bidirectional_unit_tests() {
 }
 
 layer_4_wayland_portal_tests() {
-  cargo test --locked -p platform-linux --features portal-input,portal-capture --lib
+  timeout --kill-after=15s 300s \
+    cargo test --locked -p platform-linux --features portal-input,portal-capture --lib
 }
 
 layer_5_headless_desktop_and_gtk_atspi() {
-  xvfb-run -a --server-args="-screen 0 640x480x24 -noreset" \
-    cargo test -p platform-linux --test click_input_x11 --locked -- \
-      --ignored --nocapture --test-threads=1
+  cargo test -p platform-linux --test click_input_x11 --test key_input_x11 --locked --no-run
 
-  xvfb-run -a \
-    cargo test -p platform-linux --test key_input_x11 --locked -- \
-      --ignored --nocapture --test-threads=1
+  timeout --kill-after=10s 180s \
+    xvfb-run -a --server-args="-screen 0 640x480x24 -noreset" \
+      cargo test -p platform-linux --test click_input_x11 --locked -- \
+        --ignored --nocapture --test-threads=1
+
+  timeout --kill-after=10s 180s \
+    xvfb-run -a \
+      cargo test -p platform-linux --test key_input_x11 --locked -- \
+        --ignored --nocapture --test-threads=1
 
   if [[ -f crates/platform-linux/tests/background_menu_xorg.rs ]]; then
-    xvfb-run -a --server-args="-screen 0 1280x800x24 -noreset" \
-      dbus-run-session -- bash -c '
-        set -euo pipefail
-        openbox >/tmp/cua-verify-openbox.log 2>&1 &
-        OB_PID=$!
-        trap "kill ${OB_PID} 2>/dev/null || true" EXIT
-        sleep 1
-        cargo test -p platform-linux --test background_menu_xorg --locked -- \
-          --ignored --nocapture --test-threads=1
-      '
+    cargo test -p platform-linux --test background_menu_xorg --locked --no-run
+    timeout --kill-after=10s 180s \
+      xvfb-run -a --server-args="-screen 0 1280x800x24 -noreset" \
+        dbus-run-session -- bash -c '
+          set -euo pipefail
+          export XDG_SESSION_TYPE=x11
+          export GDK_BACKEND=x11
+          export GTK_MODULES=gail:atk-bridge
+          export NO_AT_BRIDGE=0
+
+          ATSPI_LAUNCHER=""
+          for cand in /usr/libexec/at-spi-bus-launcher /usr/lib/at-spi2-core/at-spi-bus-launcher "$(command -v at-spi-bus-launcher || true)"; do
+            if [[ -n "${cand}" && -x "${cand}" ]]; then
+              ATSPI_LAUNCHER="${cand}"
+              break
+            fi
+          done
+
+          ATSPI_PID=""
+          if [[ -n "${ATSPI_LAUNCHER}" ]]; then
+            ATSPI_DBUS_IMPLEMENTATION=dbus-daemon "${ATSPI_LAUNCHER}" --launch-immediately >/tmp/cua-verify-atspi.log 2>&1 &
+            ATSPI_PID=$!
+            for _ in {1..50}; do
+              if gdbus call --session --dest org.a11y.Bus --object-path /org/a11y/bus --method org.a11y.Bus.GetAddress >/dev/null 2>&1; then
+                break
+              fi
+              sleep 0.2
+            done
+          fi
+
+          openbox >/tmp/cua-verify-openbox.log 2>&1 &
+          OB_PID=$!
+          cleanup() {
+            kill "${OB_PID}" 2>/dev/null || true
+            if [[ -n "${ATSPI_PID}" ]]; then
+              kill "${ATSPI_PID}" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          sleep 1
+          cargo test -p platform-linux --test background_menu_xorg --locked -- \
+            --ignored --nocapture --test-threads=1
+        '
   fi
 }
 

@@ -188,7 +188,8 @@ jobs:
             libx11-dev libx11-xcb-dev libxcb1-dev libxext-dev libxi-dev
             libxtst-dev libxrandr-dev libgtk-3-dev
             xvfb xauth x11-utils xdotool dbus-daemon dbus-x11 at-spi2-core
-            openbox picom python3-gi gir1.2-gtk-3.0 imagemagick ffmpeg
+            libglib2.0-bin libatk-adaptor openbox picom python3-gi gir1.2-gtk-3.0
+            imagemagick ffmpeg
 
       - name: Closed-loop conflict resolution, 5-layer test verification, AI self-healing, and publish
         if: contains(fromJSON('["merged_cleanly", "conflict", "heal_existing_pr"]'), steps.merge_attempt.outputs.status)
@@ -297,7 +298,7 @@ jobs:
 
           notify_failure() {
             local reason="$1"
-            local title="⚠️ 自动同步冲突或测试未通过需人工检查 (${UPSTREAM_SHORT})"
+            local title="⚠️ 自动同步冲突或测试未通过需人工检查"
 
             {
               echo "将上游 \`${UPSTREAM_REPO}@${UPSTREAM_SHORT}\` 同步到 \`${TARGET_BRANCH}\` 时，自动闭环（最多 ${MAX_REPAIR_ROUNDS} 轮编译/测试自愈）未能完全修复所有问题，**已拦截推送以保护目标分支**。"
@@ -326,7 +327,7 @@ jobs:
 
             local existing_num
             existing_num=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=30" \
-              --jq ".[] | select(.title == \"${title}\") | .number" | head -n 1 || true)
+              --jq '.[] | select(.title | startswith("⚠️ 自动同步")) | .number' | head -n 1 || true)
             if [[ -n "${existing_num}" ]]; then
               jq -n --rawfile body /tmp/sync_issue_body.md '{body: $body}' \
                 | gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${existing_num}/comments" --input - >/dev/null || true
@@ -386,7 +387,7 @@ jobs:
 
           PATH_RE = re.compile(r"^/v1(?:beta1?)?/models/([^/:?]+):([^?]+)(?:\?(.*))?$")
           PROJ_ERR_RE = re.compile(r"projects/([^/`\"'\s]+)/locations/")
-          BACKOFF_SECS = (5, 10, 20, 35, 50)
+          BACKOFF_SECS = (3, 7, 15, 25)
 
 
           def build_vertex_url(model: str, action: str, query: str, project: str, location: str) -> str:
@@ -917,7 +918,8 @@ jobs:
             libx11-dev libx11-xcb-dev libxcb1-dev libxext-dev libxi-dev
             libxtst-dev libxrandr-dev libgtk-3-dev
             xvfb xauth x11-utils xdotool dbus-daemon dbus-x11 at-spi2-core
-            openbox picom python3-gi gir1.2-gtk-3.0 imagemagick ffmpeg
+            libglib2.0-bin libatk-adaptor openbox picom python3-gi gir1.2-gtk-3.0
+            imagemagick ffmpeg
 
       - name: Run 5-layer bidirectional verification and publish report
         env:
