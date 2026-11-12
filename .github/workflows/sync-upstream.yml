@@ -464,7 +464,7 @@ jobs:
                       url = build_vertex_url(model, action, query, project, location)
                       req = urllib.request.Request(url, data=body, headers=headers, method="POST")
                       try:
-                          with urllib.request.urlopen(req, timeout=300) as resp:
+                          with urllib.request.urlopen(req, timeout=90) as resp:
                               self.send_response(resp.status)
                               ctype = resp.headers.get("Content-Type", "application/json")
                               self.send_header("Content-Type", ctype)
@@ -550,11 +550,34 @@ jobs:
               > "$HOME/.gemini/antigravity-cli/settings.json"
           }
 
+          workspace_snapshot_hash() {
+            (
+              git status --porcelain 2>/dev/null || true
+              git diff 2>/dev/null || true
+              git diff --cached 2>/dev/null || true
+            ) | sha256sum | awk '{print $1}'
+          }
+
+          has_remaining_conflict_markers() {
+            local cf
+            while IFS= read -r cf; do
+              if [[ -n "$cf" && -f "$cf" ]] && grep -nE '^(<<<<<<< |=======$|>>>>>>> )' -- "$cf" >/dev/null 2>&1; then
+                return 0
+              fi
+            done <<< "${CONFLICT_FILES:-}"
+            return 1
+          }
+
           invoke_agy_with_prompt() {
             local prompt_text="$1"
             ensure_agy_and_vertex_bridge
 
+            local before_hash
+            before_hash=$(workspace_snapshot_hash)
+
             run_once() {
+              local tmo="$1"
+              shift
               GEMINI_API_KEY="${VERTEX_API_KEY}" \
               GOOGLE_GEMINI_BASE_URL="http://127.0.0.1:${VERTEX_PROXY_PORT}" \
               NO_PROXY="127.0.0.1,localhost" \
@@ -563,35 +586,37 @@ jobs:
                 --settings '{"modelProvider":"gemini"}' \
                 --dangerously-skip-permissions \
                 --output-format json \
-                --print-timeout 12m \
+                --print-timeout "${tmo}" \
                 "$@" </dev/null >/tmp/agy_stdout.json 2>/tmp/agy_stderr.log
             }
 
             set +e
-            run_once --effort high
+            run_once "6m" --effort high
             local agy_rc=$?
-            local json_status
+            local json_status after_hash
             json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
+            after_hash=$(workspace_snapshot_hash)
 
-            if [[ $agy_rc -eq 3 ]] && { ! git diff --quiet || ! git diff --cached --quiet; }; then
+            if [[ $agy_rc -eq 3 && "${after_hash}" != "${before_hash}" ]] && ! has_remaining_conflict_markers; then
               set -e
-              echo "⚠️ Default model hit print-timeout after modifying workspace files; proceeding to outer deterministic verification..."
+              echo "⚠️ Default model hit print-timeout after completing clean workspace edits; proceeding to outer deterministic verification..."
               SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
               return 0
             fi
 
             if [[ $agy_rc -ne 0 || "${json_status}" != "SUCCESS" ]] && grep -qiE 'NOT_FOUND|not found|PERMISSION_DENIED|RESOURCE_EXHAUSTED|quota|429|503|overloaded|model|DEADLINE_EXCEEDED|print_timeout|print timeout' /tmp/agy_stderr.log /tmp/agy_stdout.json 2>/dev/null; then
-              echo "Default model hit quota/429, timeout, or access error; sleeping 8s and retrying with fast gemini-3.8-flash-high..."
-              sleep 8
-              run_once --model gemini-3.8-flash-high
+              echo "Default model hit quota/429, timeout, or unfinished edits; sleeping 5s and retrying with fast gemini-3.8-flash-high..."
+              sleep 5
+              run_once "10m" --model gemini-3.8-flash-high
               agy_rc=$?
               json_status=$(jq -r '.status // "ERROR"' /tmp/agy_stdout.json 2>/dev/null || echo "ERROR")
+              after_hash=$(workspace_snapshot_hash)
             fi
             set -e
 
             if [[ $agy_rc -ne 0 ]]; then
-              if [[ $agy_rc -eq 3 ]] && { ! git diff --quiet || ! git diff --cached --quiet; }; then
-                echo "⚠️ Fallback model hit print-timeout after modifying workspace files; proceeding to outer deterministic verification..."
+              if [[ $agy_rc -eq 3 && "${after_hash}" != "${before_hash}" ]] && ! has_remaining_conflict_markers; then
+                echo "⚠️ Fallback model hit print-timeout after completing clean workspace edits; proceeding to outer deterministic verification..."
                 SUMMARY=$(jq -r '.response // "已完成代码修复（外层流水线继续执行格式化与 5 层测试校验）。"' /tmp/agy_stdout.json 2>/dev/null || echo "已完成代码修复。")
                 return 0
               fi
@@ -625,17 +650,18 @@ jobs:
           }
 
           # ====================================================================
-          # 阶段 1：若存在 Git 文本冲突，先由 agy 完成代码融合（不跑耗时子进程，外层统一格式化与测试）
+          # 阶段 1：若存在 Git 文本冲突，先由 agy 完成代码融合（外层统一负责格式化、git add 与 commit）
           # ====================================================================
           if [[ "${MERGE_STATUS}" == "conflict" ]]; then
             {
-              echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态（.git/MERGE_HEAD 存在）。"
-              echo "请专注完成代码融合，不要在子命令中运行 cargo build / cargo clippy / cargo test（外层流水线会在你退出后立即自动执行 cargo fmt 与全套 5 层编译回归验证）："
-              echo "1. 运行 git status 查看所有未合并冲突文件（UU/AA/DU/UD）；"
-              echo "2. 阅读冲突文件上下文，结合 git log MERGE_HEAD -n 15 -- <冲突文件> 与 git log HEAD -n 15 -- <冲突文件> 理解上游与本分支（Linux Wayland / cua-perception 定制）双方意图，准确融合逻辑；"
-              echo "3. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何工作流文件；"
-              echo "4. 运行 git diff --check 确保无残留冲突标记，然后 git add 已解决文件并执行 git commit -m \"Merge branch 'main' (${UPSTREAM_SHORT}) into ${TARGET_BRANCH}\"；"
-              echo "5. 用简明中文逐个文件说明冲突原因与融合方式。"
+              echo "当前仓库正处于将 upstream/main (${UPSTREAM_SHORT}) 合并到 ${TARGET_BRANCH} 的合并冲突状态，以下文件存在冲突标记："
+              printf '%s\n' "${CONFLICT_FILES}"
+              echo ""
+              echo "请严格遵循以下职责边界快速完成冲突文件融合："
+              echo "1. 直接按冲突标记位置阅读上述冲突文件上下文，必要时用 git log MERGE_HEAD -n 10 -- <冲突文件> 与 git log HEAD -n 10 -- <冲突文件> 查看双方改动意图；"
+              echo "2. 同时保留上游最新改进与本分支定制逻辑（Linux Wayland / cua-perception / AT-SPI 按钮回退），清除全部 <<<<<<< / ======= / >>>>>>> 冲突标记并保存文件；"
+              echo "3. **绝对禁止**在终端子命令中执行 cargo build / cargo clippy / cargo check / cargo test，也无需手动 git commit（外层流水线会在你返回后立即自动执行 cargo fmt、git add/commit 并进入 5 层回归测试闭环）；"
+              echo "4. 严禁恢复 .github/workflows/ 下除 sync-upstream.yml 以外的任何工作流文件；最后用简明中文说明冲突原因与融合方式。"
             } > /tmp/agy_conflict_prompt.txt
 
             invoke_agy_with_prompt "$(cat /tmp/agy_conflict_prompt.txt)"
