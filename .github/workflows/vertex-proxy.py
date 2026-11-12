@@ -318,8 +318,7 @@ def make_handler(state: BridgeState):
                 headers["Accept"] = self.headers["Accept"]
 
             retry_idx = 0
-            timeout_retried = False
-            for _attempt in range(7):
+            for _attempt in range(len(state.backoff_secs) + 4):
                 url = build_vertex_url(
                     model, action, query, project, location, state.upstream_override
                 )
@@ -361,12 +360,14 @@ def make_handler(state: BridgeState):
                     self._safe_send_json(e.code, err_body)
                     return
                 except TimeoutError as e:
-                    if not timeout_retried:
-                        timeout_retried = True
+                    if retry_idx < len(state.backoff_secs):
+                        wait_s = state.backoff_secs[retry_idx]
+                        retry_idx += 1
                         sys.stderr.write(
-                            f"[vertex_proxy] Socket timeout on {model}:{action}; retrying once...\n"
+                            f"[vertex_proxy] Socket timeout on {model}:{action}; sleeping {wait_s}s before retry {retry_idx}...\n"
                         )
                         sys.stderr.flush()
+                        time.sleep(wait_s)
                         continue
                     state.inc_counter("upstream_errors")
                     msg = json.dumps({"error": {"code": 504, "message": f"Vertex proxy timeout: {e}"}}).encode("utf-8")
@@ -415,7 +416,8 @@ def make_handler(state: BridgeState):
 
 
 def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
-    """Send minimal generateContent ping to Vertex AI for each target model."""
+    """Send minimal generateContent ping to Vertex AI for each target model with retry on transient timeouts."""
+    probe_timeout = float(os.environ.get("VERTEX_PROBE_TIMEOUT_SECS", "45"))
     for raw_model in models:
         model, forced_level, _ = resolve_and_validate_model(raw_model)
         if model is None:
@@ -424,9 +426,8 @@ def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
 
         raw_payload = json.dumps(
             {
-                "contents": [{"role": "user", "parts": [{"text": "Reply with OK"}]}],
+                "contents": [{"role": "user", "parts": [{"text": "Reply with OK only."}]}],
                 "generationConfig": {
-                    "maxOutputTokens": 16,
                     "thinkingConfig": {"thinkingLevel": forced_level or "LOW"},
                 },
             }
@@ -443,15 +444,16 @@ def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
         }
 
         retry_idx = 0
+        max_attempts = len(state.backoff_secs) + 3
         ok = False
-        for _attempt in range(5):
+        for _attempt in range(max_attempts):
             url = build_vertex_url(
                 model, "generateContent", "", project, location, state.upstream_override
             )
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             t0 = time.monotonic()
             try:
-                with urllib.request.urlopen(req, timeout=60) as resp:
+                with urllib.request.urlopen(req, timeout=probe_timeout) as resp:
                     resp_bytes = resp.read()
                     elapsed = time.monotonic() - t0
                     parsed = json.loads(resp_bytes.decode("utf-8", "replace"))
@@ -480,6 +482,10 @@ def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
                 if e.code in (429, 500, 502, 503, 504) and retry_idx < len(state.backoff_secs):
                     wait_s = state.backoff_secs[retry_idx]
                     retry_idx += 1
+                    sys.stderr.write(
+                        f"[probe] HTTP {e.code} on {model}; sleeping {wait_s}s before retry {retry_idx}/{len(state.backoff_secs)}...\n"
+                    )
+                    sys.stderr.flush()
                     time.sleep(wait_s)
                     continue
                 sys.stderr.write(
@@ -487,7 +493,16 @@ def probe_live_vertex(state: BridgeState, models: list[str]) -> int:
                 )
                 return 1
             except Exception as e:
-                sys.stderr.write(f"[probe] ERROR {model}: {e}\n")
+                if retry_idx < len(state.backoff_secs):
+                    wait_s = state.backoff_secs[retry_idx]
+                    retry_idx += 1
+                    sys.stderr.write(
+                        f"[probe] Transient error on {model} ({e}); sleeping {wait_s}s before retry {retry_idx}/{len(state.backoff_secs)}...\n"
+                    )
+                    sys.stderr.flush()
+                    time.sleep(wait_s)
+                    continue
+                sys.stderr.write(f"[probe] ERROR {model} after {retry_idx} retries: {e}\n")
                 return 1
 
         if not ok:

@@ -49,6 +49,7 @@ class _MockVertexUpstream:
         self.calls: list[dict] = []
         self.mode = "normal"
         self.rate_limit_remaining = 0
+        self.stall_remaining = 0
 
         outer = self
 
@@ -78,6 +79,9 @@ class _MockVertexUpstream:
                     rl_rem = outer.rate_limit_remaining
                     if rl_rem > 0:
                         outer.rate_limit_remaining -= 1
+                    stall = outer.stall_remaining > 0 and "/projects/" in self.path
+                    if stall:
+                        outer.stall_remaining -= 1
 
                 # Simulate publisher 404 when project is missing so auto-discovery is tested.
                 if "/projects/" not in self.path:
@@ -93,6 +97,10 @@ class _MockVertexUpstream:
                     self.send_header("Content-Length", str(len(payload)))
                     self.end_headers()
                     self.wfile.write(payload)
+                    return
+
+                if stall:
+                    time.sleep(0.35)
                     return
 
                 if rl_rem > 0:
@@ -708,6 +716,37 @@ class SyncInfraTests(unittest.TestCase):
                     capture_output=True,
                 )
                 self.assertEqual(locked_check.returncode, 0, "Cargo.lock must pass --locked after reconciliation!")
+
+    def test_probe_vertex_retries_transient_read_timeout(self):
+        upstream = _MockVertexUpstream()
+        upstream.stall_remaining = 1
+        try:
+            env = os.environ.copy()
+            env["VERTEX_API_KEY"] = "test-secret-vertex-key"
+            env["VERTEX_PROJECT_ID"] = ""
+            env["VERTEX_UPSTREAM_BASE_URL"] = f"http://127.0.0.1:{upstream.port}"
+            env["VERTEX_PROBE_TIMEOUT_SECS"] = "0.1"
+            env["VERTEX_BACKOFF_SECS"] = "0.05,0.1"
+
+            res = subprocess.run(
+                [
+                    "python3",
+                    str(WF_DIR / "vertex-proxy.py"),
+                    "--probe-vertex",
+                    "--models",
+                    "gemini-3.8-flash,gemini-4-argon",
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(res.returncode, 0, f"Expected probe retry to succeed, stderr:\n{res.stderr}")
+            self.assertIn("OK gemini-3.8-flash", res.stdout)
+            self.assertIn("OK gemini-4-argon", res.stdout)
+            self.assertIn("Transient error on gemini-3.8-flash", res.stderr)
+        finally:
+            upstream.close()
 
 
 if __name__ == "__main__":

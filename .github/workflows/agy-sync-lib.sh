@@ -284,8 +284,8 @@ preflight_ai_toolchain() {
     if [[ ! -f "${proxy_script}" ]]; then
       proxy_script=".github/workflows/vertex-proxy.py"
     fi
-    echo "🔎 Probing live Vertex AI access for gemini-4-argon and gemini-3.8-flash..."
-    if ! python3 "${proxy_script}" --probe-vertex --models "gemini-4-argon,gemini-3.8-flash"; then
+    echo "🔎 Probing live Vertex AI access for gemini-3.8-flash and gemini-4-argon..."
+    if ! python3 "${proxy_script}" --probe-vertex --models "gemini-3.8-flash,gemini-4-argon"; then
       echo "ERROR: Live Vertex AI connectivity/quota probe failed for Argon or 3.8 Flash." >&2
       return 1
     fi

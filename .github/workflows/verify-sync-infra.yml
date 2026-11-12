@@ -110,7 +110,7 @@ jobs:
             echo "ERROR: VERTEX_API_KEY Secret is empty!" >&2
             exit 1
           fi
-          python3 "${SYNC_BIN_DIR}/vertex-proxy.py" --probe-vertex --models "gemini-4-argon,gemini-3.8-flash"
+          python3 "${SYNC_BIN_DIR}/vertex-proxy.py" --probe-vertex --models "gemini-3.8-flash,gemini-4-argon"
 
       - name: "[4/4] Live micro Git-conflict auto-heal smoke test via agy + Vertex proxy"
         if: github.event_name != 'workflow_dispatch' || inputs.live_vertex_probe == true
